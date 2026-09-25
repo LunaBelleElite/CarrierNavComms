@@ -1,0 +1,74 @@
+name: Bug report
+description: Something's not working right
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this — every bug report makes
+        CarrierNavComms a little more solid for the next commander who hits
+        the same thing. Your EDMC log usually turns "it broke" into something
+        I can actually chase down, so please include the relevant lines if you
+        can.
+
+  - type: input
+    id: version
+    attributes:
+      label: CarrierNavComms version
+      description: In EDMC, open Settings, then the CarrierNavComms tab. The Updates section at the bottom shows it. It looks like `ver-1.1.0.0`.
+      placeholder: ver-1.1.0.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what actually happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What were you doing right before it happened? The more exact, the better — "sold cartographics data at my carrier right after logging in docked" beats "a post went missing."
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: |
+        EDMC's own log is at `%LocalAppData%\EDMarketConnector\logs\EDMarketConnector.log`. CarrierNavComms's lines start with `[CarrierNavComms]`, so paste only those lines, plus a few around them if it helps. Please never paste a webhook URL: anyone who has one can post in your Discord server. If you see one in a line, blank it out first.
+      placeholder: Paste the relevant [CarrierNavComms] lines here.
+
+  - type: input
+    id: environment
+    attributes:
+      label: EDMC version and operating system
+      description: EDMC shows its version under Help, then About. Say Windows, Linux or Mac too.
+      placeholder: e.g. EDMC 5.13.0, Windows 11
+
+  - type: dropdown
+    id: event
+    attributes:
+      label: Which kind of event was involved?
+      options:
+        - A jump
+        - Fuel or tritium
+        - A sale (cartographics or exobiology)
+        - The settings tab or the update button
+        - Something else
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I checked existing issues and didn't see this one already reported.
+          required: true

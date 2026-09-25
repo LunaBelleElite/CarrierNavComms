@@ -117,5 +117,6 @@ existed can't update themselves, so the first release with it goes in by hand.
 
 CarrierNavComms was written with Claude Code, on Luna-Core (a starter kit for
 running a project this way), alongside Astrid, an AI personality. Something
-not working right? Open an issue on this project's page, attach your EDMC log
-if you can, and say whether you were docked at the carrier.
+not working right? Open an issue on this project's page (forms for bugs and ideas),
+attach your EDMC log if you can, and say whether you were docked at the carrier.
+Questions or a chat? Find us on [Discord](https://discord.gg/64Gg9qdgsT).

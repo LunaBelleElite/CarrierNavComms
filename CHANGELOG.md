@@ -1,5 +1,12 @@
 # Changelog
 
+## ver-1.1.0.2 - 2026-09-25
+
+- Added issue forms for bug reports and ideas on the repository's Issues page, so it's clearer what to include.
+- Added a link to the community Discord (https://discord.gg/64Gg9qdgsT) to the README.
+- The repository's About link now points to the Discord.
+- Installs on 1.1.0.0 will offer this through the **Check for updates** button.
+
 ## ver-1.1.0.0 - 2026-09-25
 
 - Added a **Check for updates** button at the bottom of the plugin's settings tab. It looks up the

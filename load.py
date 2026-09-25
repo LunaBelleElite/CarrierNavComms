@@ -22,7 +22,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.1.0.0"
+PLUGIN_VERSION = "ver-1.1.0.2"
 
 try:
     from config import config as edmc_config
