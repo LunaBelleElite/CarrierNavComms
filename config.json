@@ -1,0 +1,52 @@
+{
+  "carrier_surveillance": {
+    "enabled": true,
+    "carriers": {}
+  },
+  "embeds": {
+    "jump_scheduled": {
+      "color": 3447003,
+      "description": "### 🚀 Carrier Jump Scheduled\n\n**From System:** `{from_system}`\n**Destination System:** `{destination}`\n\n**Orbiting:** `{body}`\n\n**The Carrier will be leaving:** <t:{jump_timestamp}:R>"
+    },
+    "jump_cancelled": {
+      "color": 15158332,
+      "description": "### ❌ Carrier Jump Cancelled\n\n**Destination Was:** `{destination}`\n**Remaining In:** `{current_system}`\n\n**Status:** `Carrier jump sequence aborted.`"
+    },
+    "jump_complete": {
+      "color": 3066993,
+      "description": "### 🏁 Carrier Jump Complete\n\n**Previous System:** `{from_system}`\n**Arrival System:** `{destination}`\n\n**Orbiting:** `{body}`\n\n**Status:** `Carrier successfully locked into orbit.`"
+    },
+    "jump_complete_remote": {
+      "color": 3066993,
+      "description": "### 🏁 Carrier Jump Complete\n\n**Previous System:** `{from_system}`\n**Arrival System:** `{destination}`\n\n**Status:** `Carrier successfully arrived.`"
+    },
+    "tritium_deposited": {
+      "color": 15844367,
+      "description": "### ⛽ Tritium Donated\n\n**Commander:** `{cmdr}`\n**Amount Deposited:** `{quantity}` tons\n**Carrier:** `{carrier}`"
+    },
+    "carrier_sell_order": {
+      "color": 10181046,
+      "description": "### 📊 Carrier Market Sell Order\n\n**Carrier:** `{carrier}`\n**Now Selling:** `{item}`\n**Price:** `{price}` CR/ton\n**Quantity Available:** `{quantity}`\n\nPlease check Carrier sell order before starting this order.\nOrder was requested <t:{order_timestamp}:R>"
+    },
+    "carrier_buy_order": {
+      "color": 10181046,
+      "description": "### 📊 Carrier Market Buy Order\n\n**Carrier:** `{carrier}`\n**Now Buying:** `{item}`\n**Price:** `{price}` CR/ton\n**Quantity Requested:** `{quantity}`\n\nPlease check Carrier buy order before starting this order.\nOrder was requested <t:{order_timestamp}:R>"
+    },
+    "trade_sale": {
+      "color": 3066993,
+      "description": "### 📦 Carrier Market Sale\n\n**Commander:** `{cmdr}`\n**Action:** Sold `{quantity}` units of `{item}`\n**Carrier:** `{carrier}`\n**Total Transaction:** `{total_price}` CR"
+    },
+    "trade_purchase": {
+      "color": 15105570,
+      "description": "### 📦 Carrier Market Purchase\n\n**Commander:** `{cmdr}`\n**Action:** Purchased `{quantity}` units of `{item}`\n**Carrier:** `{carrier}`\n**Total Transaction:** `{total_price}` CR"
+    },
+    "cartographics": {
+      "color": 3447003,
+      "description": "### 🌌 Universal Cartographics Turn-In\n\n**Commander:** `{cmdr}`\n**Carrier:** `{carrier}`\n**Total Payout:** `{total_earned}` CR\n**Systems Turned In:** `{systems}`\n**First Discoveries:** `{first_discoveries}`\n**First Mapped:** `{first_mapped}`\n**Bonus Earned:** `{bonus}` CR{data_note}"
+    },
+    "exobiology": {
+      "color": 10181046,
+      "description": "### 🧬 Vista Genomics Turn-In\n\n**Commander:** `{cmdr}`\n**Carrier:** `{carrier}`\n**Total Payout:** `{total_earned}` CR\n**First Discoveries:** `{first_discoveries}`"
+    }
+  }
+}
