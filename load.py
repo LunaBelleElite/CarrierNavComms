@@ -3,11 +3,26 @@ import sys
 import re
 import json
 import time
+import functools
 import glob
+import importlib.util
 import threading
+import copy
+import hashlib
+import io
+import queue
+import shutil
+import subprocess
+import tokenize
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 import requests
 from datetime import datetime, timezone
-from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas
+from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
+
+PLUGIN_VERSION = "ver-1.1.0.0"
 
 try:
     from config import config as edmc_config
@@ -794,10 +809,825 @@ def generate_embed_from_config(embed_key, active_cmdr, c_display, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Self-updater: the "Check for updates" button in the settings tab
+# ---------------------------------------------------------------------------
+# Asks the public repository for its latest GitHub Release, and on the user's confirmation
+# downloads it, verifies it, replaces load.py, rebuilds config.json without losing the user's
+# data, then relaunches EDMC. Everything is fail-closed: anything unexpected refuses the update.
+PINNED_API_URL = "https://api.github.com/repos/LunaBelleElite/CarrierNavComms/releases/latest"
+PINNED_DOWNLOAD_PREFIX = "https://github.com/LunaBelleElite/CarrierNavComms/releases/download/"
+UPDATE_API_URL = PINNED_API_URL                  # test hooks: tests point these at a local server
+UPDATE_DOWNLOAD_PREFIX = PINNED_DOWNLOAD_PREFIX
+PLUGIN_DIR_OVERRIDE = None                       # test hook: plugin folder to update
+IS_WINDOWS = sys.platform == "win32"
+RELEASE_ASSET_NAME = "CarrierNavComms.zip"
+MAX_ASSET_BYTES = 1048576                        # an asset must be UNDER 1 MB
+MAX_MEMBER_BYTES = 1048576
+API_MAX_BYTES = 1048576
+API_DEADLINE_SECONDS = 15                        # overall time allowed for the release query ...
+DOWNLOAD_DEADLINE_SECONDS = 60                   # ... and for the download (the 10 s socket timeout is per read)
+SOCKET_TIMEOUT_SECONDS = 10
+MAX_REDIRECTS = 5
+_OPENER_EXTRA_HANDLERS = []                      # test hook: extra urllib handlers (for example "no proxy")
+ZIP_LOAD_ENTRY = "CarrierNavComms/load.py"
+ZIP_CONFIG_ENTRY = "CarrierNavComms/config.json"
+CONFIG_BACKUPS_KEPT = 3
+_TAG_RE = re.compile(r"ver-([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)")
+_plugin_dir = None
+_main_window = None
+_update_flow_lock = threading.Lock()             # held for the whole check -> confirm -> install -> restart flow
+_perform_lock = threading.Lock()                 # only one perform_update at a time
+_restart_lock = threading.Lock()
+_restart_requested = False                       # set once a restart helper has been spawned
+
+# sha256 of json.dumps(embed, sort_keys=True) for each embed as shipped in v0.73 and in ver-1.0.0.0
+# (two entries only where they differ). A user template equal to one of these was never customised.
+_SHIPPED_EMBED_HASHES = {  # sha256 of json.dumps(embed, sort_keys=True): v0.73 and ver-1.0.0.0
+    "carrier_buy_order": ("519c9ac03eaa368b1b231b156981f7bb8d61b4f05e1421198c34982404f69a1d",),
+    "carrier_sell_order": ("6d8266500e94466cf4d68e7c687f7022ba94390f29d8ba2c43142436a133c7ff",),
+    "cartographics": ("d9c1ab93438b36716bcea69a181e27f85c61a12a9239d861a767c151fb5dac72", "7529621c173838f3c3625e83ab7671ef950eb10b8a892d7bd677ef7e2932469d"),
+    "exobiology": ("30771f17b58b0b8bbf18bbf283eb4c805711f361888c65519f8e99520fcdc55d",),
+    "jump_cancelled": ("71f25c54b5552b82376f92a4a9023760078059895f7a20d8ad1963a5d4d32c55",),
+    "jump_complete": ("2be1a09da9e93cc3e6f79031188dbee86e5d2980c0e22ff02a98ba5e8fea4177",),
+    "jump_complete_remote": ("e2ae99b13027147729d715c5733fb885ec29b63779ed9a2c1f10adeb4aff2052",),
+    "jump_scheduled": ("bbb975c5dc864fb47c3dfd2a43f68f17dc6f912231d6ef9658d441ea3ddc304f",),
+    "trade_purchase": ("e5bd3f629506dc5ba995f304036420eda759e0f4abc5dbec4a0b9ede2dae7afa",),
+    "trade_sale": ("4b8cbe3a34f48f667c89ad6e3bf6e314a73568227129f3982ed67559a2fafc81",),
+    "tritium_deposited": ("5064d1d683e0f08be8129c36622f6b27159e5f74221c6165e533a2d597a11a5b",),
+}
+
+
+class UpdateError(Exception):
+    """An update step refused or failed; the message is meant for the user."""
+
+
+def get_plugin_dir():
+    return PLUGIN_DIR_OVERRIDE or _plugin_dir or os.path.dirname(os.path.abspath(__file__))
+
+
+def parse_version(tag):
+    m = _TAG_RE.fullmatch(tag) if isinstance(tag, str) else None
+    if not m:
+        return None
+    try:
+        return tuple(int(g) for g in m.groups())
+    except ValueError:                  # a number with thousands of digits: Python refuses to convert it
+        return None
+
+
+def is_newer(latest, current):
+    """True only when `latest` is strictly newer than `current`. Never true on doubt."""
+    a, b = parse_version(latest), parse_version(current)
+    if a is None or b is None:
+        return False
+    return a > b
+
+
+def evaluate_release(tag, current=None):
+    """Returns (state, message); state is 'update', 'current', 'ahead' or 'error'."""
+    current = PLUGIN_VERSION if current is None else current
+    if is_newer(tag, current):
+        return "update", "Version %s is available (you have %s)." % (tag, current)
+    a, b = parse_version(tag), parse_version(current)
+    if a is None or b is None:
+        return "error", "Could not compare versions (%s, %s)." % (tag, current)
+    if a == b:
+        return "current", "You're up to date (%s)." % current
+    return "ahead", "You're ahead of the latest release (latest %s, you have %s)." % (tag, current)
+
+
+def _overrides_in_use():
+    """True when a test has pointed the updater at its own host instead of the pinned GitHub URLs."""
+    return UPDATE_API_URL != PINNED_API_URL or UPDATE_DOWNLOAD_PREFIX != PINNED_DOWNLOAD_PREFIX
+
+
+class _RedirectGuard(urllib.request.HTTPRedirectHandler):
+    """Follows at most MAX_REDIRECTS redirects, and only to https (plain http only for a test host)."""
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme = urllib.parse.urlparse(newurl).scheme.lower()
+        if scheme != "https" and not (scheme == "http" and _overrides_in_use()):
+            raise UpdateError("GitHub redirected the request to an address that is not https (%s); not updating."
+                              % (scheme or "no scheme"))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _http_get(url, limit, what, deadline):
+    """GETs url and returns at most `limit` bytes. `deadline` is the OVERALL time allowed in seconds; the
+    socket timeout alone applies to each read, so a slow drip could otherwise go on for ever."""
+    req = urllib.request.Request(url, headers={"User-Agent": "CarrierNavComms/" + PLUGIN_VERSION,
+                                               "Accept": "application/vnd.github+json"})
+    opener = urllib.request.build_opener(_RedirectGuard, *_OPENER_EXTRA_HANDLERS)
+    started = time.monotonic()
+    try:
+        with opener.open(req, timeout=SOCKET_TIMEOUT_SECONDS) as resp:
+            reader = getattr(resp, "read1", resp.read)
+            chunks, total = [], 0
+            while total <= limit:
+                if time.monotonic() - started > deadline:
+                    raise UpdateError("GitHub took too long to send the %s; not updating." % what)
+                chunk = reader(min(8192, limit + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            data = b"".join(chunks)
+    except UpdateError:
+        raise
+    except urllib.error.HTTPError as e:
+        code = e.code
+        try:
+            e.close()
+        except Exception:
+            pass
+        if code in (403, 429):
+            raise UpdateError("GitHub is rate limiting requests right now (HTTP %d). Try again later." % code)
+        raise UpdateError("GitHub answered the %s request with HTTP %d." % (what, code))
+    except Exception as e:
+        raise UpdateError("Could not reach GitHub (%s). Check your internet connection." % getattr(e, "reason", e))
+    if len(data) > limit:
+        raise UpdateError("The %s is larger than allowed; not updating." % what)
+    return data
+
+
+def _only_update_errors(fn):
+    """Whatever bad input does inside `fn`, the caller sees an UpdateError and nothing else."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except UpdateError:
+            raise
+        except Exception as e:
+            raise UpdateError("Unexpected problem while %s (%s: %s); not updating." % (fn.__name__.replace("_", " "), type(e).__name__, e))
+    return wrapper
+
+
+@_only_update_errors
+def fetch_latest_release():
+    """Asks GitHub for the latest release. Returns {'tag','url','size','digest'} or raises UpdateError."""
+    raw = _http_get(UPDATE_API_URL, API_MAX_BYTES, "release information", API_DEADLINE_SECONDS)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        data = None
+    if not isinstance(data, dict):
+        raise UpdateError("GitHub returned release information in an unexpected form; not updating.")
+    tag = data.get("tag_name")
+    if parse_version(tag) is None:
+        raise UpdateError("The latest release has an unexpected version tag; not updating.")
+    if data.get("draft") is not False or data.get("prerelease") is not False:
+        raise UpdateError("The latest release is a draft or prerelease; not updating.")
+    assets = data.get("assets")
+    asset = None
+    if isinstance(assets, list):
+        asset = next((a for a in assets if isinstance(a, dict) and a.get("name") == RELEASE_ASSET_NAME), None)
+    if asset is None:
+        raise UpdateError("The latest release has no %s file; not updating." % RELEASE_ASSET_NAME)
+    url = asset.get("browser_download_url")
+    if not isinstance(url, str) or not url.startswith(UPDATE_DOWNLOAD_PREFIX):
+        raise UpdateError("The release file is not hosted where expected; not updating.")
+    size = asset.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 < size < MAX_ASSET_BYTES:
+        raise UpdateError("The release file has an unexpected size; not updating.")
+    digest = asset.get("digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+        raise UpdateError("The release carries no SHA-256 digest to check the download against; not updating.")
+    return {"tag": tag, "url": url, "size": size, "digest": digest}
+
+
+def _check_zip_entries(infos):
+    """The zip must hold exactly the two expected files: no extras, directories or odd names."""
+    names = [i.filename for i in infos]
+    if sorted(names) != sorted([ZIP_LOAD_ENTRY, ZIP_CONFIG_ENTRY]) or any(i.is_dir() for i in infos):
+        raise UpdateError("The download's zip entries are not exactly %s and %s; not updating."
+                          % (ZIP_LOAD_ENTRY, ZIP_CONFIG_ENTRY))
+    if any(i.file_size > MAX_MEMBER_BYTES for i in infos):
+        raise UpdateError("A file inside the download is too large; not updating.")
+
+
+def _read_member(zf, name):
+    """Reads one member BY NAME into memory (nothing is ever extracted to disk)."""
+    try:
+        with zf.open(name) as f:
+            data = f.read(MAX_MEMBER_BYTES + 1)
+    except Exception as e:
+        raise UpdateError("Could not read %s from the download (%s); not updating." % (name, e))
+    if len(data) > MAX_MEMBER_BYTES:
+        raise UpdateError("%s is too large; not updating." % name)
+    return data
+
+
+# The version-line rule is the release guard's (scripts/check-release-safe.sh, checks A5 and C5), copied
+# exactly: one column-zero line, PLUGIN_VERSION = "ver-A.B.C.D" in double quotes, no -dev suffix, then
+# optional spaces or tabs and an optional # comment. Anything the guard accepts must be accepted here.
+_VERSION_LINE_CANDIDATE = re.compile(r"^PLUGIN_VERSION\b")
+_VERSION_LINE_EXACT = re.compile(r'^PLUGIN_VERSION = "(ver-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"[ \t]*(#.*)?$')
+
+
+def _declared_version(text):
+    """The version a load.py declares, or None unless it has exactly one line in the exact form.
+    Lines end at CRLF, CR or LF, as they do for Python itself and for the release guard."""
+    candidates = [l for l in re.split(r"\r\n|\r|\n", text) if _VERSION_LINE_CANDIDATE.match(l)]
+    if len(candidates) != 1:
+        return None
+    m = _VERSION_LINE_EXACT.match(candidates[0])
+    return m.group(1) if m else None
+
+
+def _source_text(raw):
+    """Decodes a load.py the way Python reads it: a UTF-8 BOM is dropped and a PEP 263 coding cookie is
+    honoured. Undecodable bytes become replacement characters (only used to look for the version line)."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+    except SyntaxError:
+        # detect_encoding is stricter than compile(): bad UTF-8 in a comment on the first two lines makes it
+        # give up although Python compiles the file. compile() has already accepted this file, so read it as UTF-8.
+        encoding = "utf-8"
+    return raw.decode(encoding, "replace")
+
+
+def _config_problem(data):
+    """Why a config.json is not plain UTF-8 (the release guard's rule, exactly), or None if it is."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return "starts with a UTF-8 byte-order mark"
+    if data.startswith(b"\xff\xfe\x00\x00") or data.startswith(b"\x00\x00\xfe\xff"):
+        return "starts with a UTF-32 byte-order mark"
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return "starts with a UTF-16 byte-order mark"
+    if b"\x00" in data:
+        return "contains a NUL byte"
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return "is not valid UTF-8"
+    return None
+
+
+@_only_update_errors
+def download_and_verify(release):
+    """Downloads and fully verifies a release. Returns {'tag','load_bytes','config'}. Writes nothing to disk."""
+    url, size, digest, tag = release["url"], release["size"], release["digest"], release["tag"]
+    if not url.startswith(UPDATE_DOWNLOAD_PREFIX):
+        raise UpdateError("The release file is not hosted where expected; not updating.")
+    data = _http_get(url, size, "download", DOWNLOAD_DEADLINE_SECONDS)
+    if len(data) != size:
+        raise UpdateError("The download is %d bytes but the release says %d; not updating." % (len(data), size))
+    if "sha256:" + hashlib.sha256(data).hexdigest() != digest.lower():
+        raise UpdateError("The download's SHA-256 does not match the release digest; not updating.")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:
+        raise UpdateError("The download is not a valid zip file; not updating.")
+    with zf:
+        _check_zip_entries(zf.infolist())
+        load_bytes = _read_member(zf, ZIP_LOAD_ENTRY)
+        config_bytes = _read_member(zf, ZIP_CONFIG_ENTRY)
+    try:
+        compile(load_bytes, "load.py", "exec")           # the raw bytes, as Python itself (and the guard) read them
+        text = _source_text(load_bytes)
+    except Exception as e:
+        raise UpdateError("The new load.py does not compile (%s); not updating." % e)
+    if _declared_version(text) != tag:
+        raise UpdateError("The new load.py does not declare PLUGIN_VERSION = \"%s\"; not updating." % tag)
+    problem = _config_problem(config_bytes)
+    if problem:
+        raise UpdateError("The release's config.json is not plain UTF-8 (it %s); not updating." % problem)
+    try:
+        config = json.loads(config_bytes.decode("utf-8"))
+    except (ValueError, RecursionError):
+        raise UpdateError("The release's config.json is not valid JSON; not updating.")
+    surveillance = config.get("carrier_surveillance") if isinstance(config, dict) else None
+    if not isinstance(surveillance, dict) or surveillance.get("carriers") != {}:
+        raise UpdateError("The release's config.json must have an empty carriers list; not updating.")
+    return {"tag": tag, "load_bytes": load_bytes, "config": config}
+
+
+def _replace_file(path, data):
+    """Writes data next to path, then swaps it into place."""
+    tmp = path + ".new"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())                 # on disk before the swap, so a power cut cannot leave a hollow file
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _purge_bytecode(plugin_dir):
+    """Deletes the cached bytecode for load.py (every interpreter tag). Python trusts a cache whose recorded
+    source size and modification second match, so a same-size replacement written in the same second
+    would otherwise keep loading the OLD code. Errors are ignored: a leftover cache is no worse than before."""
+    load_path = os.path.join(plugin_dir, "load.py")
+    found = set()
+    try:
+        found.add(importlib.util.cache_from_source(load_path))
+    except Exception:
+        pass
+    try:
+        found.update(glob.glob(os.path.join(glob.escape(os.path.join(plugin_dir, "__pycache__")), "load.*.pyc")))
+    except Exception:
+        pass
+    for path in found:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def apply_update(new_load_bytes, plugin_dir=None):
+    """Backs up load.py to load.py.bak, then swaps the new one in. On any error the old one is restored."""
+    d = plugin_dir or get_plugin_dir()
+    load_path = os.path.join(d, "load.py")
+    backup = load_path + ".bak"
+    original = None
+    try:
+        with open(load_path, "rb") as f:
+            original = f.read()
+        shutil.copy2(load_path, backup)
+        _replace_file(load_path, new_load_bytes)
+        _purge_bytecode(d)
+    except Exception as e:
+        try:
+            if original is not None and os.path.exists(load_path):
+                with open(load_path, "rb") as f:
+                    current = f.read()
+                if current != original:
+                    _replace_file(load_path, original)
+                    _purge_bytecode(d)
+        except Exception:
+            pass
+        raise UpdateError("Could not install the new load.py (%s). The previous version was kept." % e)
+
+
+def _restore_from_backup(plugin_dir):
+    load_path = os.path.join(plugin_dir, "load.py")
+    try:
+        with open(load_path + ".bak", "rb") as f:
+            _replace_file(load_path, f.read())
+        _purge_bytecode(plugin_dir)
+    except Exception as e:
+        raise UpdateError("Could not restore the previous load.py from load.py.bak (%s)." % e)
+
+
+def _canon_hash(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _previous_default_hashes(plugin_dir):
+    """Hashes of the previous release's defaults per embed: config.defaults.json wins, else the built-in table."""
+    hashes = {k: set(v) for k, v in _SHIPPED_EMBED_HASHES.items()}
+    try:
+        with open(os.path.join(plugin_dir, "config.defaults.json"), "r", encoding="utf-8") as f:
+            embeds = json.load(f).get("embeds")
+        if isinstance(embeds, dict):
+            for key, value in embeds.items():
+                hashes[key] = {_canon_hash(value)}
+    except Exception:
+        pass
+    return hashes
+
+
+def _write_json(path, doc):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _merge_config(user, release, prev_hashes):
+    """Builds the new config: the release's document with the user's data laid over it."""
+    new = copy.deepcopy(release)
+    for key, value in user.items():
+        if key not in ("carrier_surveillance", "embeds"):
+            new[key] = copy.deepcopy(value)           # a key this updater does not know: the user's stays
+    if "carrier_surveillance" in user:
+        new["carrier_surveillance"] = copy.deepcopy(user["carrier_surveillance"])   # in full
+    user_embeds = user.get("embeds")
+    release_embeds = release.get("embeds") if isinstance(release.get("embeds"), dict) else {}
+    if isinstance(user_embeds, dict):
+        merged = {}
+        for key, default in release_embeds.items():
+            mine = user_embeds.get(key)
+            if key not in user_embeds:
+                merged[key] = copy.deepcopy(default)                  # new in the release (or missing)
+            elif mine == default or _canon_hash(mine) in prev_hashes.get(key, ()):
+                merged[key] = copy.deepcopy(default)                  # never customised: new default
+            else:
+                merged[key] = copy.deepcopy(mine)                     # customised: the user's stays
+                if key == "cartographics" and isinstance(mine, dict) and isinstance(mine.get("description"), str) \
+                        and "{data_note}" not in mine["description"]:
+                    merged[key]["description"] = mine["description"] + "{data_note}"
+        for key, mine in user_embeds.items():
+            if key not in release_embeds:
+                merged[key] = copy.deepcopy(mine)                     # an embed key we do not know
+        new["embeds"] = merged
+    return new
+
+
+def _find_loss(old, new, release_embed_keys):
+    """Returns a description of the first thing in `old` that is missing or different in `new`, else None."""
+    for key, value in old.items():
+        if key not in ("carrier_surveillance", "embeds") and new.get(key) != value:
+            return "the setting '%s'" % key
+    old_cs, new_cs = old.get("carrier_surveillance"), new.get("carrier_surveillance")
+    if old_cs is not None and not isinstance(new_cs, dict):
+        return "the carrier_surveillance section"
+    if isinstance(old_cs, dict):
+        for key, value in old_cs.items():
+            if key != "carriers" and (key not in new_cs or new_cs[key] != value):
+                return "carrier_surveillance.%s" % key
+        old_carriers = old_cs.get("carriers")
+        new_carriers = new_cs.get("carriers")
+        if isinstance(old_carriers, dict):
+            if not isinstance(new_carriers, dict):
+                return "the carriers list"
+            for callsign, carrier in old_carriers.items():
+                if callsign not in new_carriers:
+                    return "carrier %s" % callsign
+                if not isinstance(carrier, dict):
+                    if new_carriers[callsign] != carrier:
+                        return "carrier %s" % callsign
+                    continue
+                mine = new_carriers[callsign]
+                if not isinstance(mine, dict):
+                    return "carrier %s" % callsign
+                for field, value in carrier.items():
+                    if field not in mine:
+                        return "carrier %s: field %s is missing" % (callsign, field)
+                    if field == "webhooks" and isinstance(value, list):
+                        got = mine[field] if isinstance(mine[field], list) else []
+                        for i, hook in enumerate(value):
+                            if i >= len(got) or got[i] != hook:
+                                return "carrier %s: webhook #%d" % (callsign, i + 1)
+                    if mine[field] != value:
+                        return "carrier %s: field %s changed" % (callsign, field)
+    old_embeds = old.get("embeds")
+    if isinstance(old_embeds, dict):
+        new_embeds = new.get("embeds") if isinstance(new.get("embeds"), dict) else {}
+        for key, value in old_embeds.items():
+            if key not in release_embed_keys and new_embeds.get(key) != value:
+                return "the custom template '%s'" % key
+    return None
+
+
+@_only_update_errors
+def rebuild_user_config(release_config, plugin_dir=None, now=None, _tamper=None):
+    """Rebuilds the user's config.json around the release's, keeping everything the user owns.
+
+    Returns {'status': 'rebuilt'|'created'|'invalid', ...}. Raises UpdateError, with config.json
+    untouched, if the result would have lost anything. `_tamper` is a test hook applied to the new
+    document before it is written and checked."""
+    d = plugin_dir or get_plugin_dir()
+    config_path = os.path.join(d, "config.json")
+    defaults_path = os.path.join(d, "config.defaults.json")
+    notes = []
+    if not os.path.exists(config_path):
+        _write_json(config_path, release_config)
+        try:
+            _write_json(defaults_path, release_config)
+        except Exception:
+            notes.append("config.defaults.json could not be saved")
+        return {"status": "created", "notes": notes}
+    try:
+        with open(config_path, "rb") as f:
+            raw = f.read()
+    except OSError as e:                  # locked or unreadable: we cannot know what is in it, so do not update
+        raise UpdateError("Could not read your config.json (%s). Nothing was changed." % e)
+    try:
+        user = json.loads(raw.decode("utf-8"))
+        if not isinstance(user, dict):
+            raise ValueError("not a JSON object")
+    except RecursionError:
+        raise UpdateError("Your config.json is nested too deeply to be read. Nothing was changed.")
+    except ValueError as e:
+        return {"status": "invalid", "notes": ["Your config.json is not valid JSON (%s), so it was left exactly as it is." % e]}
+    stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    backup = "%s.bak-%s" % (config_path, stamp)
+    tmp = config_path + ".tmp"
+    try:
+        shutil.copy2(config_path, backup)
+        old_backups = sorted(glob.glob(glob.escape(config_path) + ".bak-*"), reverse=True)
+        for stale in old_backups[CONFIG_BACKUPS_KEPT:]:
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        new = _merge_config(user, release_config, _previous_default_hashes(d))
+        if _tamper is not None:
+            _tamper(new)
+        _write_json(tmp, new)
+        with open(tmp, "r", encoding="utf-8") as f:
+            written = json.load(f)
+        embeds = release_config.get("embeds")
+        lost = _find_loss(user, written, set(embeds) if isinstance(embeds, dict) else set())
+        if lost:
+            raise UpdateError("The rebuilt config.json would have lost %s, so it was not used. "
+                              "Your config.json was not changed." % lost)
+        os.replace(tmp, config_path)
+    except UpdateError:
+        raise
+    except Exception as e:
+        raise UpdateError("Could not rebuild config.json (%s). Your config.json was not changed." % e)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    try:
+        _write_json(defaults_path, release_config)
+    except Exception:
+        notes.append("config.defaults.json could not be saved")
+    return {"status": "rebuilt", "backup": backup, "notes": notes}
+
+
+def perform_update(bundle, plugin_dir=None, _tamper=None):
+    """Installs a verified bundle: load.py first, then the config, rolling load.py back if the config fails."""
+    with _perform_lock:                     # one install at a time, whoever calls
+        d = plugin_dir or get_plugin_dir()
+        tag = bundle["tag"]
+        if not is_newer(tag, PLUGIN_VERSION):
+            raise UpdateError("Not installing %s: it is not newer than the installed %s." % (tag, PLUGIN_VERSION))
+        apply_update(bundle["load_bytes"], d)
+        try:
+            result = rebuild_user_config(bundle["config"], d, _tamper=_tamper)
+        except BaseException as e:
+            # Anything at all after the swap puts the previous load.py back first. Only then does the
+            # error go on: an UpdateError as it is, another Exception as an UpdateError, and
+            # KeyboardInterrupt / SystemExit untouched.
+            if isinstance(e, UpdateError):
+                reason = str(e)
+            elif isinstance(e, Exception):
+                reason = "Unexpected error while rebuilding config.json (%s: %s)." % (type(e).__name__, e)
+            else:
+                reason = None
+            try:
+                _restore_from_backup(d)
+            except UpdateError as restore_error:
+                if reason is None:
+                    raise
+                raise UpdateError("%s Also: %s" % (reason, restore_error))
+            if reason is None:
+                raise
+            raise UpdateError("%s The previous load.py was restored." % reason)
+        return " ".join(["Updated to %s." % tag] + result.get("notes", []))
+
+
+# The helper's PowerShell text is FIXED: no value is ever spliced into it. PowerShell treats U+2018,
+# U+2019, U+201A and U+201B as single quotes as well, so any quoting scheme that builds script text from
+# data can be broken out of (command injection, or a helper that fails after EDMC was told to quit).
+# Every value therefore travels in an environment variable of the helper process instead.
+_RESTART_SCRIPT = (
+    "Wait-Process -Id ([int]$env:CNC_PID) -Timeout ([int]$env:CNC_TIMEOUT) -ErrorAction SilentlyContinue; "
+    "if (Get-Process -Id ([int]$env:CNC_PID) -ErrorAction SilentlyContinue) { exit 1 }; "
+    "$sp = @{ FilePath = $env:CNC_EXE }; "
+    "if ($env:CNC_ARGLINE) { $sp.ArgumentList = $env:CNC_ARGLINE }; "
+    "if ($env:CNC_CWD) { $sp.WorkingDirectory = [WildcardPattern]::Escape($env:CNC_CWD) }; "
+    "Start-Process @sp"
+)
+
+
+def _powershell_exe():
+    """The system's own powershell.exe by absolute path when it exists, else the bare name."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir")
+    if root:
+        candidate = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return "powershell.exe"
+
+
+def build_restart_helper(pid, exe, args, cwd=None, timeout=60):
+    """The restart helper's command line and the environment variables it needs (pure): (cmd, env).
+    The helper waits for EDMC's process to end and then starts the same program again. If EDMC is
+    still alive when the wait times out it exits 1 without starting anything, so a second copy can
+    never appear."""
+    env = {
+        "CNC_PID": str(int(pid)),
+        "CNC_TIMEOUT": str(int(timeout)),
+        "CNC_EXE": str(exe),
+        "CNC_ARGLINE": subprocess.list2cmdline([str(a) for a in args]) if args else "",
+        "CNC_CWD": str(cwd) if cwd else "",
+    }
+    cmd = [_powershell_exe(), "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", _RESTART_SCRIPT]
+    return cmd, env
+
+
+def spawn_restart_helper(pid, exe, args, timeout=60, cwd=None):
+    """Starts the helper windowless and independent of this process (own process group, no shared handles)."""
+    CREATE_NO_WINDOW, CREATE_NEW_PROCESS_GROUP = 0x08000000, 0x00000200
+    cmd, extra = build_restart_helper(pid, exe, args, cwd=cwd, timeout=timeout)
+    env = dict(os.environ)
+    env.update(extra)
+    return subprocess.Popen(cmd, env=env,
+                            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, close_fds=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def restart_target(frozen, executable, argv):
+    """What to relaunch (pure): (program, arguments). Packaged EDMC is its own executable and takes
+    argv[1:]. Run from source, the executable is the Python interpreter and the script path (argv[0])
+    must be passed too, or the interpreter would start empty."""
+    argv = list(argv)
+    return (executable, argv[1:]) if frozen else (executable, argv)
+
+
+def restart_edmc():
+    """Closes EDMC and relaunches it. Returns (started, message). EDMC is only asked to close after the
+    helper has started, so a failure never leaves the user without EDMC."""
+    manual = "Please restart EDMC to finish the update."
+    if not IS_WINDOWS:
+        return False, "Update installed. " + manual
+    if _main_window is None:
+        return False, "Update installed, but EDMC's main window is not known. " + manual
+    global _restart_requested
+    with _restart_lock:
+        if _restart_requested:
+            return False, "A restart is already under way."
+        try:
+            exe, args = restart_target(getattr(sys, "frozen", False), sys.executable, sys.argv)
+            spawn_restart_helper(os.getpid(), exe, args, cwd=os.getcwd())
+        except Exception as e:
+            return False, "Update installed, but the restart helper could not start (%s). %s" % (e, manual)
+        _restart_requested = True     # a helper is now waiting on EDMC: a second one must never be started
+    try:
+        frame = getattr(prefs_changed, "frame", None)
+        top = frame.winfo_toplevel() if frame is not None else None
+        if top is not None and top is not _main_window:
+            top.destroy()
+    except Exception:
+        pass
+    try:
+        _main_window.event_generate("<<Quit>>", when="tail")
+    except Exception as e:
+        return False, "Update installed, but EDMC could not be asked to close (%s). %s" % (e, manual)
+    return True, ""
+
+
+def _confirm_text(tag):
+    text = "Update to %s and restart EDMC now?" % tag
+    with pending_jumps_lock:
+        waiting = bool(pending_jumps)
+    if waiting:
+        text += "\n\nWarning: a pending not-aboard carrier arrival note will be lost by the restart."
+    text += "\n\nAny unsaved changes in this settings window will be lost."
+    return text
+
+
+def _tk_safe(fn):
+    """Runs a widget or variable touch that may find its window already destroyed. Returns True if it worked."""
+    try:
+        fn()
+        return True
+    except TclError:
+        return False
+
+
+def _widget_alive(widget):
+    try:
+        return bool(widget.winfo_exists())
+    except TclError:
+        return False
+
+
+def _start_update_check(frame, button, status_var):
+    """Button handler. Network work runs on threads; results come back through a queue polled with
+    after(), because tkinter must only be touched from the UI thread.
+
+    Only one update flow runs at a time, whichever settings window started it. The polling is driven
+    from EDMC's main window when it is known, because Tk deletes a widget's pending after() callbacks
+    when the widget is destroyed: a settings window closed mid-install must not strand the install."""
+    if not _update_flow_lock.acquire(blocking=False):
+        _tk_safe(lambda: status_var.set("An update is already in progress."))
+        return
+    results = queue.Queue()
+    released = []
+
+    def release():
+        if not released:
+            released.append(True)
+            _update_flow_lock.release()
+
+    def check_worker():
+        try:
+            results.put(("checked", fetch_latest_release()))
+        except UpdateError as e:
+            results.put(("done", str(e)))
+        except Exception as e:
+            results.put(("done", "Unexpected error while checking: %s" % e))
+
+    def install_worker(release_info):
+        try:
+            results.put(("installed", perform_update(download_and_verify(release_info))))
+        except UpdateError as e:
+            results.put(("done", str(e)))
+        except Exception as e:
+            results.put(("done", "Unexpected error while updating: %s" % e))
+
+    def finish(message):
+        _tk_safe(lambda: status_var.set(message))
+        _tk_safe(lambda: button.state(["!disabled"]))
+        release()
+        return False
+
+    def handle(kind, payload):
+        """Returns True while more results are expected."""
+        if kind == "done":
+            return finish(payload)
+        if kind == "checked":
+            state, message = evaluate_release(payload["tag"])
+            if state != "update":
+                return finish(message)
+            if not _widget_alive(frame):
+                return finish("Update cancelled because the settings window was closed. Nothing was changed.")
+            if not messagebox.askyesno("Update CarrierNavComms", _confirm_text(payload["tag"]), parent=frame):
+                return finish("Update cancelled. Nothing was changed.")
+            _tk_safe(lambda: status_var.set("Downloading and verifying %s..." % payload["tag"]))
+            threading.Thread(target=install_worker, args=(payload,), daemon=True).start()
+            return True
+        if kind == "installed":
+            _tk_safe(lambda: status_var.set(payload + " Restarting EDMC..."))
+            started, message = restart_edmc()
+            return finish(payload if started else payload + " " + message)
+        return finish("Unexpected update state.")
+
+    def schedule():
+        """Queues the next poll on the main window if there is one, else on the settings frame."""
+        for target in (_main_window, frame):
+            if target is None:
+                continue
+            try:
+                target.after(100, poll)
+                return True
+            except Exception:
+                continue                # that window is gone; try the next
+        release()                       # nobody can report the outcome any more: do not hold the flow forever
+        return False
+
+    def poll():
+        try:
+            item = results.get_nowait()
+        except queue.Empty:
+            schedule()
+            return
+        try:
+            more = handle(*item)
+        except Exception as e:
+            more = finish("Unexpected error: %s" % e)
+        if more:
+            schedule()
+
+    def on_frame_destroyed(event):
+        # With no main window to drive the polling, a closed settings window means no poll will ever run
+        # again, so nothing else would clear the in-progress flag.
+        if event.widget is frame and not (_main_window is not None and _widget_alive(_main_window)):
+            release()
+
+    try:
+        _tk_safe(lambda: button.state(["disabled"]))
+        _tk_safe(lambda: status_var.set("Checking for updates..."))
+        _tk_safe(lambda: frame.bind("<Destroy>", on_frame_destroyed, add="+"))
+        threading.Thread(target=check_worker, daemon=True).start()
+        schedule()
+    except BaseException:
+        release()
+        raise
+
+
+def _build_updates_section(frame):
+    """The Updates section, gridded below every existing control of the settings tab."""
+    section = ttk.Frame(frame)
+    section.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 5))
+    ttk.Label(section, text="Updates", font=("Helvetica", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+    ttk.Label(section, text="Installed version: " + PLUGIN_VERSION).grid(row=1, column=0, columnspan=2, sticky="w")
+    status_var = StringVar(value="")
+    button = ttk.Button(section, text="Check for updates")
+    button.configure(command=lambda: _start_update_check(frame, button, status_var))
+    button.grid(row=2, column=0, sticky="w", pady=4)
+    ttk.Label(section, textvariable=status_var, wraplength=420, justify="left").grid(row=2, column=1, sticky="w", padx=8)
+    Tooltip(button, "Look for a newer CarrierNavComms release. You are asked before anything is installed.")
+    frame.updater_section = section
+    frame.updater_button = button
+    frame.updater_status_var = status_var
+
+
+# ---------------------------------------------------------------------------
 # EDMC Plugin Entrypoints
 # ---------------------------------------------------------------------------
 def plugin_start3(plugin_dir):
     """Initializes plugin at EDMC startup."""
+    global _plugin_dir
+    _plugin_dir = plugin_dir or None
     deep_scan_journals_for_carrier_ids()
     seed_carrier_systems_from_logs()
     seed_dock_state_from_logs()
@@ -808,6 +1638,11 @@ def plugin_start3(plugin_dir):
 
 def plugin_app(parent):
     """Builds EDMC main window interface."""
+    global _main_window
+    try:
+        _main_window = parent.winfo_toplevel()   # kept so the updater can raise <<Quit>> on it
+    except Exception:
+        _main_window = None
     label = Label(parent, text="CarrierNavComms Active")
     return label
 
@@ -1194,6 +2029,8 @@ def plugin_prefs(notebook, cmdr, is_beta):
     btn_add = ttk.Button(frame, text="+ Add Fleet Carrier", command=add_new_carrier)
     btn_add.grid(row=3, column=0, sticky="w", padx=10, pady=10)
     Tooltip(btn_add, "Add a new Fleet Carrier to track.")
+
+    _build_updates_section(frame)   # row 4, below every existing control
 
     frame.enabled_var = enabled_var
     frame.carrier_rows = carrier_rows
