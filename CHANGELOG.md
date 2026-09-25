@@ -1,20 +1,5 @@
 # Changelog
 
-## Versioning scheme
-
-This project uses a 4-number version format: `ver-A.B.C.D`. The `ver-` prefix is always present.
-
-- **A (1st number):** a complete redesign/rewrite of the whole program or layout.
-- **B (2nd number):** changes to core features, short of a full redesign.
-- **C (3rd number):** large bug fixes.
-- **D (4th number):** very small bug fixes. A doc/spec-only addition (no feature, no bugfix) counts as a 4th-number change too, same treatment as a minor bugfix.
-
-Any number can climb arbitrarily high. When a higher-order number increments, every number to its right resets to 0.
-
-This repository's first release is `ver-1.0.0.0`, and its releases are tagged with the version exactly as written above.
-
-(This section is not edited when entries below are added, only when the scheme itself changes.)
-
 ## ver-1.1.0.0 - 2026-09-25
 
 - Added a **Check for updates** button at the bottom of the plugin's settings tab. It looks up the
