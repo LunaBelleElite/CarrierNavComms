@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import tokenize
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,7 +24,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.1.0.3"
+PLUGIN_VERSION = "ver-1.2.0.0"
 
 try:
     from config import config as edmc_config
@@ -88,12 +89,13 @@ def get_carrier_image(inara_url):
                 IMAGE_CACHE[inara_url] = img_url
                 return img_url
 
-            print(f"[CarrierNavComms] No scrapeable image found on Inara page: {inara_url}")
+            print(f"[CarrierNavComms] No scrapeable image found on Inara page: {_clean_text(inara_url, limit=300)}")
         else:
-            print(f"[CarrierNavComms] Inara page returned HTTP {r.status_code} for: {inara_url}")
+            print(f"[CarrierNavComms] Inara page returned HTTP {r.status_code} for: {_clean_text(inara_url, limit=300)}")
 
     except Exception as e:
-        print(f"[CarrierNavComms] Inara image scrape warning: {e}")
+        # the Inara field is user text and could hold a webhook URL pasted by mistake: never print it (or an exception quoting it)
+        print(f"[CarrierNavComms] Inara image scrape warning: {_clean_text(e, limit=300)}")
 
     return None
 
@@ -650,15 +652,204 @@ def deep_scan_journals_for_carrier_ids():
 # ---------------------------------------------------------------------------
 # Webhook & Broadcast Logic
 # ---------------------------------------------------------------------------
-def broadcast_surveillance_embed(webhook_urls, embed_data, sender_name="Fleet Carrier", inara_url=""):
-    """Sends webhook payload to all specified Discord webhook URLs."""
+POST_TIMEOUT = 5                       # seconds a single webhook post may take
+POST_LOG_NAME = "post-failures.log"
+POST_LOG_CAP = 32 * 1024               # bytes; at write time a full log is renamed to .old (or, if that fails, started over)
+LAST_POST_MAX_CHARS = 120              # the settings tab's Last post label is cut to this many characters
+_last_post = {"time": None, "ok": None, "text": ""}   # the most recent broadcast: epoch seconds, success flag, text
+_post_lock = threading.Lock()
+
+_CTRL_RE = re.compile("[\x00-\x1f\x7f-\x9f  ]")
+_WEBHOOK_PATTERNS = (
+    # a full URL (also the other Discord host, and its percent-encoded form)
+    re.compile(r"https?(?:://|%3A%2F%2F)[^\s'\")]*?(?:/|%2F)api(?:/|%2F)webhooks[^\s'\")]*", re.I),
+    # the bare path requests embeds in its exception texts ("url: /api/webhooks/<id>/<token>")
+    re.compile(r"(?:/|%2F)api(?:/|%2F)webhooks[^\s'\")]*", re.I),
+    # a webhook id followed by its token
+    re.compile(r"\b\d{17,25}(?:/|%2F)[A-Za-z0-9_.\-]{20,}", re.I),
+)
+
+
+def _redact(text, urls=()):
+    """Replaces anything that looks like a webhook URL (or a known one, or its long path pieces) by <webhook>.
+    Format characters (Unicode category Cf, e.g. U+200B, U+202E) are removed first, so a URL or token split by one
+    is still caught; the caller's known pieces match case-insensitively (a library may lowercase part of a URL)."""
+    text = "".join(ch for ch in str(text) if unicodedata.category(ch) != "Cf")
+    for u in urls:
+        if not isinstance(u, str) or not u.strip():
+            continue
+        u = u.strip()
+        pieces = [u, urllib.parse.quote(u, safe="")]
+        try:
+            pieces += [seg for seg in urllib.parse.urlsplit(u).path.split("/") if len(seg) >= 16]
+        except Exception:
+            pass
+        for piece in pieces:
+            text = re.sub(re.escape(piece), "<webhook>", text, flags=re.I)
+    for pat in _WEBHOOK_PATTERNS:
+        text = pat.sub("<webhook>", text)
+    return text
+
+
+def _clean_text(text, urls=(), limit=200):
+    """Redacted, control characters replaced by spaces, whitespace collapsed, cut to `limit` characters."""
+    t = _redact(text, urls)
+    t = _CTRL_RE.sub(" ", t)
+    t = _redact(t, urls)
+    return re.sub(r"\s{2,}", " ", t).strip()[:limit]
+
+
+def _fmt_seconds(value):
+    return "%g" % value
+
+
+def _classify_http_failure(r, urls):
+    """The reason text for a webhook that answered with something other than 200/204."""
+    code = getattr(r, "status_code", "?")
+    message, discord_code, retry_after = "", None, None
+    try:
+        raw = r.content
+        if isinstance(raw, (bytes, bytearray)) and len(raw) <= 65536:
+            body = json.loads(bytes(raw).decode("utf-8", errors="replace"))
+            if isinstance(body, dict):
+                if isinstance(body.get("message"), str):
+                    message = body["message"]
+                dc = body.get("code")
+                if (isinstance(dc, int) and not isinstance(dc, bool)) or (isinstance(dc, str) and dc.strip()):
+                    discord_code = dc
+                ra = body.get("retry_after")
+                if isinstance(ra, (int, float)) and not isinstance(ra, bool) and 0 <= ra < 1e9:
+                    retry_after = ra
+    except Exception:
+        pass
+    if code == 429 and retry_after is not None:
+        return "HTTP 429 rate limited, retry after %s s" % _fmt_seconds(retry_after)
+    reason = "HTTP %s" % code
+    if message.strip():
+        reason += " " + message
+        if discord_code is not None:
+            reason += " (%s)" % discord_code
+    return _clean_text(reason, urls)
+
+
+def _classify_exception(e, urls):
+    """The reason text for a post that raised: class name plus a redacted message, never a URL."""
+    if isinstance(e, requests.exceptions.Timeout):
+        return "timed out after %s s" % _fmt_seconds(POST_TIMEOUT)
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return "could not connect (%s)" % type(e).__name__
+    msg = _clean_text(str(e), urls)
+    name = type(e).__name__
+    return _clean_text("%s: %s" % (name, msg) if msg else name, urls)
+
+
+def _append_post_log(lines):
+    """Appends lines to post-failures.log, rotating at the cap. Never raises."""
+    try:
+        data = "".join(l + "\n" for l in lines).encode("utf-8", errors="replace")
+        with _post_lock:
+            path = post_log_path()
+            data = data[-POST_LOG_CAP:]             # one batch alone can never pass the cap
+            mode = "ab"
+            try:
+                if os.path.getsize(path) + len(data) > POST_LOG_CAP:
+                    try:
+                        os.replace(path, path + ".old")
+                    except OSError:
+                        mode = "wb"                 # cannot rotate (a folder or a lock on .old): start the live log over, never grow past the cap
+            except OSError:
+                pass
+            with open(path, mode) as f:
+                f.write(data)
+    except Exception:
+        pass
+
+
+def _record_post(event, carrier, attempted, failures, success_count):
+    """Updates _last_post and, when anything failed, writes the log lines and one EDMC log line. Never raises."""
+    global _last_post
+    try:
+        parts = ["Channel %d: %s" % (n, why) for n, why in failures]
+        if attempted == 0:
+            text = "no usable webhook URL"
+            parts = [text]
+        elif not failures:
+            text = "Sent to %d channel(s)" % success_count
+        elif success_count:
+            text = "%d of %d channels failed: %s" % (len(failures), attempted, "; ".join(parts))
+        else:
+            text = "; ".join(parts)
+        ok = bool(success_count) and not failures
+        _last_post = {"time": time.time(), "ok": ok, "text": text}
+        if not ok:
+            ev = _clean_text(event, limit=60) or "-"
+            ca = _clean_text(carrier, limit=60) or "-"
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                _append_post_log(["%s  %s  %s  %s" % (stamp, ev, ca, p) for p in parts])
+            except Exception:
+                pass
+            print("[CarrierNavComms] post failed: %s  %s  %s" % (ev, ca, text))
+    except Exception:
+        pass
+
+
+def last_post_text():
+    """What the settings tab shows about the most recent post."""
+    snap = _last_post
+    if not snap.get("time"):
+        return "Last post: none yet"
+    try:
+        stamp = time.localtime(snap["time"])
+        same_day = stamp[:3] == time.localtime()[:3]
+        when = time.strftime("%H:%M" if same_day else "%m-%d %H:%M", stamp)      # the date only when it was not today
+    except Exception:
+        when = "?"
+    if snap.get("ok"):
+        text = "Last post: OK " + when
+    else:
+        text = "Last post: FAILED %s (%s)" % (when, snap.get("text", ""))
+    # the label must not grow the tab: the full text stays in _last_post and the log
+    return text if len(text) <= LAST_POST_MAX_CHARS else text[:LAST_POST_MAX_CHARS - 3] + "..."
+
+
+_INARA_IMAGE_OFF_WORDS = ("false", "0", "off", "no", "n", "disabled", "0.0", "-0")
+
+
+def inara_image_enabled(value):
+    """Reads a carrier's saved use_inara_image tolerantly. OFF only for False, a numeric 0 or the words
+    false/0/off/no/n/disabled/0.0/-0 (any case, stripped); absent, None, True and anything unrecognised are ON, so a carrier
+    saved before this switch existed behaves exactly as it always did."""
+    if isinstance(value, str):
+        return value.strip().lower() not in _INARA_IMAGE_OFF_WORDS
+    if isinstance(value, (int, float)) and value == 0:      # False is an int 0 too
+        return False
+    return True
+
+
+def _post_webhook(url, payload):
+    """requests.post that does not follow redirects: a Discord webhook never redirects, so a 3xx is a failure to
+    record, not a POST silently re-sent as a GET and counted as Sent."""
+    try:
+        return requests.post(url, json=payload, timeout=POST_TIMEOUT, allow_redirects=False)
+    except TypeError:
+        # only a stand-in that predates the keyword (the other test suites' fakes) refuses it; the real requests never does
+        return requests.post(url, json=payload, timeout=POST_TIMEOUT)
+
+
+def broadcast_surveillance_embed(webhook_urls, embed_data, sender_name="Fleet Carrier", inara_url="", event="", carrier="", use_image=True):
+    """Sends webhook payload to all specified Discord webhook URLs. Every outcome is classified by the
+    webhook's position number (never its URL); failures are recorded (log file, EDMC log, _last_post).
+    use_image=False makes no Inara image lookup at all (no page fetch, no cache) and sets no embed image;
+    the heading link to Inara is unaffected."""
     if not webhook_urls:
         return False, "No webhook URLs provided"
 
     if inara_url:
-        carrier_img = get_carrier_image(inara_url)
-        if carrier_img:
-            embed_data["image"] = {"url": carrier_img}
+        if use_image:
+            carrier_img = get_carrier_image(inara_url)
+            if carrier_img:
+                embed_data["image"] = {"url": carrier_img}
 
         if inara_url.startswith("http"):
             existing_desc = embed_data.get("description", "")
@@ -681,24 +872,29 @@ def broadcast_surveillance_embed(webhook_urls, embed_data, sender_name="Fleet Ca
     }
 
     success_count = 0
-    errors = []
+    attempted = 0
+    failures = []
+    known_urls = [u for u in webhook_urls if isinstance(u, str)]
 
-    for url in webhook_urls:
+    for number, url in enumerate(webhook_urls, start=1):
         clean_url = url.strip() if isinstance(url, str) else ""
         if clean_url:
+            attempted += 1
             try:
-                r = requests.post(clean_url, json=payload, timeout=5)
+                r = _post_webhook(clean_url, payload)
                 if r.status_code in [200, 204]:
                     success_count += 1
                 else:
-                    errors.append(f"HTTP {r.status_code}")
+                    failures.append((number, _classify_http_failure(r, known_urls)))
             except Exception as e:
-                errors.append(str(e))
+                failures.append((number, _classify_exception(e, known_urls)))
+
+    _record_post(event, carrier, attempted, failures, success_count)
 
     if success_count > 0:
         return True, f"Sent to {success_count} webhook(s)"
     else:
-        err_msg = ", ".join(errors) if errors else "Failed to send"
+        err_msg = "; ".join("Channel %d: %s" % f for f in failures) if failures else "Failed to send"
         return False, err_msg
 
 
@@ -1451,6 +1647,12 @@ def restart_log_path():
     return os.path.join(d, RESTART_LOG_NAME)
 
 
+def post_log_path():
+    """Where failed posts are logged: beside the plugin, or the temp folder if that is unknown."""
+    d = PLUGIN_DIR_OVERRIDE or _plugin_dir or tempfile.gettempdir()
+    return os.path.join(d, POST_LOG_NAME)
+
+
 def build_restart_helper(pid, exe, args, cwd=None, timeout=60, log_path=None):
     """The restart helper's command line and the environment variables it needs (pure): (cmd, env).
     The helper waits for EDMC's process to end and then starts the same program again. If EDMC is
@@ -1512,6 +1714,22 @@ def echo_restart_log(lines=6):
         rows = [ln.strip() for ln in text.splitlines() if ln.strip()]
         for ln in rows[-lines:]:
             print("[CarrierNavComms] last restart: " + ln)
+    except Exception:
+        pass
+
+
+def echo_post_failures(lines=3):
+    """Prints the last few lines of post-failures.log to EDMC's log at start. Nothing when there is no log. Never raises."""
+    try:
+        with open(post_log_path(), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        rows = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in rows[-lines:]:
+            print("[CarrierNavComms] last post failure: " + _clean_text(ln, limit=400))
     except Exception:
         pass
 
@@ -1681,21 +1899,59 @@ def _start_update_check(frame, button, status_var):
         raise
 
 
-def _build_updates_section(frame):
-    """The Updates section, gridded below every existing control of the settings tab."""
-    section = ttk.Frame(frame)
+def _refresh_last_post_label(frame):
+    """Shows last_post_text() in the tab's Last post label. Tolerates a destroyed widget."""
+    try:
+        frame.last_post_label.configure(text=last_post_text())
+    except (TclError, RuntimeError, AttributeError):
+        pass
+
+
+def _build_updates_section(frame, host=None):
+    """The Updates section, gridded below every existing control of the settings tab.
+
+    host is the widget that holds the tab's controls (the small-screen layout's inner body); it
+    defaults to the frame itself. The attributes the tests and the updater use stay on the frame.
+    """
+    section = ttk.Frame(host if host is not None else frame)
     section.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 5))
-    ttk.Label(section, text="Updates", font=("Helvetica", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
-    ttk.Label(section, text="Installed version: " + PLUGIN_VERSION).grid(row=1, column=0, columnspan=2, sticky="w")
+    frame.updater_heading = ttk.Label(section, text="Updates", font=("Helvetica", 10, "bold"))
+    frame.updater_version_label = ttk.Label(section, text="Installed version: " + PLUGIN_VERSION)
     status_var = StringVar(value="")
     button = ttk.Button(section, text="Check for updates")
     button.configure(command=lambda: _start_update_check(frame, button, status_var))
-    button.grid(row=2, column=0, sticky="w", pady=4)
-    ttk.Label(section, textvariable=status_var, wraplength=420, justify="left").grid(row=2, column=1, sticky="w", padx=8)
+    frame.updater_status_label = ttk.Label(section, textvariable=status_var, wraplength=420, justify="left")
     Tooltip(button, "Look for a newer CarrierNavComms release. You are asked before anything is installed.")
+    frame.last_post_label = ttk.Label(section, text=last_post_text(), wraplength=420, justify="left")
     frame.updater_section = section
     frame.updater_button = button
     frame.updater_status_var = status_var
+    _grid_updates_section(frame, False)
+
+
+def _grid_updates_section(frame, compact):
+    """Grids the Updates section's widgets: the normal four rows, or (small screens) one row plus Last post."""
+    section = frame.updater_section
+    heading, version, button = frame.updater_heading, frame.updater_version_label, frame.updater_button
+    status, last_post = frame.updater_status_label, frame.last_post_label
+    for w in (heading, version, button, status, last_post):
+        w.grid_forget()
+    if compact:
+        heading.configure(text="Updates:")
+        heading.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        version.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        button.grid(row=0, column=2, sticky="w", padx=(0, 8))
+        status.grid(row=0, column=3, sticky="w")
+        last_post.grid(row=1, column=0, columnspan=4, sticky="w")
+        section.grid_configure(pady=(2, 2))
+    else:
+        heading.configure(text="Updates")
+        heading.grid(row=0, column=0, columnspan=2, sticky="w")
+        version.grid(row=1, column=0, columnspan=2, sticky="w")
+        button.grid(row=2, column=0, sticky="w", pady=4)
+        status.grid(row=2, column=1, sticky="w", padx=8)
+        last_post.grid(row=3, column=0, columnspan=2, sticky="w")
+        section.grid_configure(pady=(10, 5))
 
 
 # ---------------------------------------------------------------------------
@@ -1711,6 +1967,7 @@ def plugin_start3(plugin_dir):
     reconstruct_exploration_tally_from_logs()
     print("[CarrierNavComms] Plugin loaded successfully.")
     echo_restart_log()
+    echo_post_failures()
     return "CarrierNavComms"
 
 
@@ -1728,6 +1985,73 @@ def plugin_app(parent):
 # ---------------------------------------------------------------------------
 # Plugin Settings UI
 # ---------------------------------------------------------------------------
+# Small-screen layout budget. All sizes are Tk logical pixels, so 125/150 percent display scaling is
+# simply a smaller screen height.
+OS_MARGIN = 100             # the OS title bar plus the taskbar, which the settings box also has to fit beside
+ESTIMATED_CHROME = 130      # EDMC's own dialog furniture (tab row, OK/Cancel row, padding) until it can be measured
+MIN_VISIBLE_CARDS = 1.5     # the card list always shows at least this many cards
+MIN_OUTER_HEIGHT = 120      # the whole-tab scroll area is never squeezed below this
+MIN_EMPTY_VIEWPORT = 60     # with no carriers the (empty) list area may shrink to this on a short screen
+SCREEN_HEIGHT_OVERRIDE = None   # test hook: a number replaces winfo_screenheight()
+
+
+def _screen_height(widget):
+    """The screen height the layout budgets against (the test hook wins when set)."""
+    if SCREEN_HEIGHT_OVERRIDE:
+        return int(SCREEN_HEIGHT_OVERRIDE)
+    return int(widget.winfo_screenheight())
+
+
+class _TestsSection:
+    """One carrier card's test-button rows behind a 'Send test messages' toggle.
+
+    In the small-screen (compact) layout the toggle is shown and the rows start collapsed; in the
+    normal layout the toggle is hidden and the rows are always shown, exactly as before.
+    """
+
+    def __init__(self, box, toggle_parent, status_lbl, on_change):
+        self.box = box
+        self.status_lbl = status_lbl
+        self.on_change = on_change
+        self.expanded = True
+        self.toggle = ttk.Button(toggle_parent, width=22, command=self.flip)
+        self._sync_text()
+        Tooltip(self.toggle, "Show or hide this carrier's test-message buttons.")
+
+    def _sync_text(self):
+        self.toggle.configure(text="Send test messages  " + ("v" if self.expanded else ">"))
+
+    def flip(self):
+        self.set_expanded(not self.expanded)
+
+    def set_expanded(self, expanded, notify=True):
+        try:
+            self.expanded = bool(expanded)
+            if self.expanded:
+                if not self.box.winfo_manager():
+                    opts = {"fill": "x", "expand": True}
+                    if self.status_lbl.winfo_manager():
+                        opts["before"] = self.status_lbl      # keep the rows above the status line
+                    self.box.pack(**opts)
+            else:
+                self.box.pack_forget()
+            self._sync_text()
+        except TclError:
+            return
+        if notify and self.on_change:
+            self.on_change()
+
+    def apply_mode(self, compact):
+        try:
+            if compact:
+                self.toggle.pack(side="right", padx=2)
+            else:
+                self.toggle.pack_forget()
+        except TclError:
+            return
+        self.set_expanded(not compact, notify=False)
+
+
 def plugin_prefs(notebook, cmdr, is_beta):
     """Builds the EDMC settings tab UI."""
     config = load_config()
@@ -1736,26 +2060,7 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
     frame = get_mynotebook_frame(notebook)
 
-    enabled_var = BooleanVar(value=surveillance.get("enabled", True))
-    chk_enabled = ttk.Checkbutton(frame, text="Enable Carrier Surveillance Notifications", variable=enabled_var)
-    chk_enabled.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=5)
-    Tooltip(chk_enabled, "Turn all Discord notifications for your tracked Fleet Carriers on or off.")
-
-    lbl_title = ttk.Label(frame, text="Configured Fleet Carriers", font=("Helvetica", 10, "bold"))
-    lbl_title.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2))
-
-    # Carrier cards are tall, so more than two of them ran off the bottom of the settings
-    # window -- and EDMC does not scroll plugin preference tabs, which left later carriers
-    # completely unreachable. Tkinter has no scrollable frame, so the cards now live in a
-    # fixed-height Canvas that scrolls. Only the container changes: carriers_container
-    # keeps its name and role, so all the card-building code below is untouched. The
-    # enable checkbox (row 0) and the Add button (row 3) stay outside it, staying pinned.
-    scroll_host = ttk.Frame(frame)
-    scroll_host.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=5)
-    scroll_host.grid_rowconfigure(0, weight=1)
-    scroll_host.grid_columnconfigure(0, weight=1)
-
-    canvas_opts = {"height": 300, "highlightthickness": 0, "bd": 0}  # replaced by _size_viewport()
+    canvas_opts = {"height": 300, "highlightthickness": 0, "bd": 0}  # replaced by the layout budget
     try:
         # A Canvas is a plain tk widget and won't inherit EDMC's theme, so its default
         # background would show through beneath the cards whenever the list is short.
@@ -1764,6 +2069,36 @@ def plugin_prefs(notebook, cmdr, is_beta):
             canvas_opts["background"] = themed_bg
     except Exception:
         pass
+
+    # Last resort for very small screens: the whole tab body sits in an outer scroll canvas. It is
+    # always built, but sized to its content and with its scrollbar hidden unless the content cannot
+    # fit the screen, so on a big screen the tab looks and measures exactly as it did without it.
+    # Every control below is a child of `body`; the state the tests and the updater read stays on `frame`.
+    outer_canvas = Canvas(frame, **{k: v for k, v in canvas_opts.items() if k != "height"})
+    outer_scrollbar = ttk.Scrollbar(frame, orient="vertical", command=outer_canvas.yview)
+    outer_canvas.configure(yscrollcommand=outer_scrollbar.set)
+    outer_canvas.grid(row=0, column=0, sticky="nw")
+    body = ttk.Frame(outer_canvas)
+    outer_canvas.create_window((0, 0), window=body, anchor="nw")
+
+    enabled_var = BooleanVar(value=surveillance.get("enabled", True))
+    chk_enabled = ttk.Checkbutton(body, text="Enable Carrier Surveillance Notifications", variable=enabled_var)
+    chk_enabled.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=5)
+    Tooltip(chk_enabled, "Turn all Discord notifications for your tracked Fleet Carriers on or off.")
+
+    lbl_title = ttk.Label(body, text="Configured Fleet Carriers", font=("Helvetica", 10, "bold"))
+    lbl_title.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2))
+
+    # Carrier cards are tall, so more than two of them ran off the bottom of the settings
+    # window -- and EDMC does not scroll plugin preference tabs, which left later carriers
+    # completely unreachable. Tkinter has no scrollable frame, so the cards now live in a
+    # fixed-height Canvas that scrolls. Only the container changes: carriers_container
+    # keeps its name and role, so all the card-building code below is untouched. The
+    # enable checkbox (row 0) and the Add button (row 3) stay outside it, staying pinned.
+    scroll_host = ttk.Frame(body)
+    scroll_host.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=5)
+    scroll_host.grid_rowconfigure(0, weight=1)
+    scroll_host.grid_columnconfigure(0, weight=1)
 
     carriers_canvas = Canvas(scroll_host, **canvas_opts)
     carriers_canvas.grid(row=0, column=0, sticky="nsew")
@@ -1776,31 +2111,20 @@ def plugin_prefs(notebook, cmdr, is_beta):
     carriers_container.grid_columnconfigure(0, weight=1)
     carriers_window = carriers_canvas.create_window((0, 0), window=carriers_container, anchor="nw")
 
-    # How many carrier cards should be visible before the list starts scrolling.
+    # How many carrier cards the list shows before it starts scrolling, when the screen has room.
     VISIBLE_CARDS = 2
-    _viewport_height = {"value": None}
 
-    def _size_viewport():
-        """Sizes the scroll viewport to fit VISIBLE_CARDS cards.
-
-        The card height is measured at runtime rather than hardcoded -- it depends on the
-        EDMC theme, font, and display scaling, and a guessed pixel value was wrong enough
-        to show only a single carrier.
-        """
-        cards = carriers_container.winfo_children()
-        if not cards:
-            return
-        card_height = max(c.winfo_reqheight() for c in cards) + 10  # + the grid pady
-        desired = card_height * VISIBLE_CARDS
-        # Never let the list alone push the settings window off a smaller screen.
-        desired = max(200, min(desired, int(carriers_canvas.winfo_screenheight() * 0.6)))
-        if _viewport_height["value"] != desired:
-            _viewport_height["value"] = desired
-            carriers_canvas.configure(height=desired)
+    # State of the small-screen layout (see _relayout below). The card height is measured at
+    # runtime rather than hardcoded -- it depends on the EDMC theme, font, and display scaling.
+    layout = {"compact": False, "outer_active": False, "viewport": None, "ready": False,
+              "after": None, "busy": False, "sb_shown": False, "wheel_owner": None}
+    card_ctls = []      # one _TestsSection per card
+    section_by_status = {}      # a card's status label -> its _TestsSection (the test lambdas already pass the label)
 
     def _sync_scrollregion(_event=None):
         carriers_canvas.configure(scrollregion=carriers_canvas.bbox("all"))
-        _size_viewport()
+        if layout["ready"]:
+            _relayout(False)
         # A Canvas defaults to a fixed ~378px width regardless of its contents, which would
         # clip the cards horizontally (there is no horizontal scrollbar). Grow it to fit the
         # widest card. Grow-only, so this can't oscillate against the width sync below.
@@ -1811,8 +2135,17 @@ def plugin_prefs(notebook, cmdr, is_beta):
     def _sync_inner_width(event):
         carriers_canvas.itemconfigure(carriers_window, width=event.width)
 
-    carriers_container.bind("<Configure>", _sync_scrollregion)
-    carriers_canvas.bind("<Configure>", _sync_inner_width)
+    def _tolerant(fn):
+        # A Configure can arrive while the window is being destroyed; a layout callback must never raise into Tk.
+        def run(*args):
+            try:
+                fn(*args)
+            except (TclError, RuntimeError):
+                pass
+        return run
+
+    carriers_container.bind("<Configure>", _tolerant(_sync_scrollregion))
+    carriers_canvas.bind("<Configure>", _tolerant(_sync_inner_width))
 
     # Wheel events go to whatever widget sits under the pointer (an Entry, a Label, ...),
     # so a binding on the canvas alone would never fire. Bind globally only while the
@@ -1823,9 +2156,13 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
     def _grab_wheel(_event=None):
         carriers_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        layout["wheel_owner"] = "cards"
 
     def _release_wheel(_event=None):
         carriers_canvas.unbind_all("<MouseWheel>")
+        layout["wheel_owner"] = None
+        if layout["ready"] and _pointer_in_tab():
+            _grab_outer_wheel()     # left the list but still on the tab: the outer scroll area takes over
 
     carriers_canvas.bind("<Enter>", _grab_wheel)
     carriers_canvas.bind("<Leave>", _release_wheel)
@@ -1838,6 +2175,8 @@ def plugin_prefs(notebook, cmdr, is_beta):
             widget.destroy()
 
         carrier_rows.clear()
+        card_ctls.clear()
+        section_by_status.clear()
         card_idx = 0
 
         for cid, cdata in list(carriers_dict.items()):
@@ -1854,6 +2193,7 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
             c_inara = cdata.get("inara_url", "") if isinstance(cdata, dict) else ""
             c_owner = cdata.get("owner_cmdr", "") if isinstance(cdata, dict) else ""
+            c_use_inara = inara_image_enabled(cdata.get("use_inara_image")) if isinstance(cdata, dict) else True
 
             card = ttk.LabelFrame(carriers_container, text=f" Fleet Carrier ({cid if cid else 'New'}) ")
             card.grid(row=card_idx, column=0, sticky="we", padx=5, pady=5)
@@ -1863,6 +2203,7 @@ def plugin_prefs(notebook, cmdr, is_beta):
             v_name = StringVar(value=c_name)
             v_inara = StringVar(value=c_inara)
             v_owner = StringVar(value=c_owner)
+            v_use_inara = BooleanVar(value=c_use_inara)
 
             r1 = ttk.Frame(card)
             r1.pack(fill="x", expand=True, padx=5, pady=2)
@@ -1924,6 +2265,10 @@ def plugin_prefs(notebook, cmdr, is_beta):
             ent_owner = ttk.Entry(r1b, textvariable=v_owner, width=20, state="readonly")
             ent_owner.pack(side="left", padx=(0, 8))
             Tooltip(ent_owner, "Read-only — auto-filled only by Fetch ID, and only when run by the carrier's actual owner. Blank is normal otherwise. Jump and Sell/Buy Order messages only send from the owner's install, preventing duplicates from crew.")
+
+            chk_use_inara = ttk.Checkbutton(r1b, text="Use Inara image", variable=v_use_inara)
+            chk_use_inara.pack(side="left", padx=(0, 8))
+            Tooltip(chk_use_inara, "Adds this carrier's Inara picture to every message. Turn it off when you're doing lots of jumps: no image lookup, and shorter messages, so more of them fit in your Discord channel.")
 
             def make_del_cmd(target_key):
                 def remove_card():
@@ -1990,7 +2335,17 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
             OWNER_ONLY_TEST_KEYS = ("jump_scheduled", "jump_cancelled", "jump_complete", "carrier_sell_order", "carrier_buy_order")
 
-            def run_single_test(embed_key, name_var, id_var, wh_list_vars, inara_var, owner_var, lbl):
+            # The two rows of test buttons live in tests_box so the small-screen layout can fold them away.
+            tests_box = ttk.Frame(card)
+            tests_section = _TestsSection(tests_box, r1b, status_lbl, lambda: _relayout(False))
+            section_by_status[status_lbl] = tests_section
+
+            def run_single_test(embed_key, name_var, id_var, wh_list_vars, inara_var, owner_var, lbl, use_var):
+                # This function is rebound per card, but the buttons' lambdas look it up by name when clicked
+                # and so always reach the LAST card's copy: pick the card's section from the label they pass.
+                section = section_by_status.get(lbl)
+                if section is not None:
+                    section.set_expanded(True)      # a test's status line must be visible
                 lbl.pack(fill="x", padx=10, pady=(2, 5))
 
                 if embed_key in OWNER_ONLY_TEST_KEYS:
@@ -2011,8 +2366,10 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
                 embed = generate_embed_from_config(embed_key, active_cmdr, c_display)
                 ok, msg = broadcast_surveillance_embed(
-                    urls, embed, sender_name=name_var.get() or "Fleet Carrier", inara_url=inara_var.get()
+                    urls, embed, sender_name=name_var.get() or "Fleet Carrier", inara_url=inara_var.get(),
+                    event=embed_key, carrier=id_var.get().strip(), use_image=use_var.get()
                 )
+                _refresh_last_post_label(frame)
                 if ok:
                     lbl.config(text=f"Success ({embed_key})! {msg}", foreground="green")
                 else:
@@ -2022,61 +2379,64 @@ def plugin_prefs(notebook, cmdr, is_beta):
             test_btn_tip = "Sends a sample version of this message to the webhook(s) above, so you can preview the formatting."
             owner_test_btn_tip = "Carrier Owner Only. Sends only if Fetch ID confirmed you as owner and Elite Dangerous is running as that CMDR — otherwise it's skipped, matching real behavior."
 
-            r_btn_owner_label = ttk.Frame(card)
+            r_btn_owner_label = ttk.Frame(tests_box)
             r_btn_owner_label.pack(fill="x", expand=True, padx=5, pady=(4, 0))
             lbl_owner_tests = ttk.Label(r_btn_owner_label, text="Owner-Only Tests (requires Elite Dangerous running):", font=("Helvetica", 8, "bold"))
             lbl_owner_tests.pack(side="left")
             Tooltip(lbl_owner_tests, "These buttons only send if Fetch ID has confirmed you as this carrier's owner AND Elite Dangerous is currently running with that commander logged in.")
 
-            r_btn1 = ttk.Frame(card)
+            r_btn1 = ttk.Frame(tests_box)
             r_btn1.pack(fill="x", expand=True, padx=5, pady=(0, 2))
 
-            btn_jump_sched = ttk.Button(r_btn1, text="Jump Scheduled", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("jump_scheduled", nv, iv, wvs, inv, ov, sl))
+            btn_jump_sched = ttk.Button(r_btn1, text="Jump Scheduled", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("jump_scheduled", nv, iv, wvs, inv, ov, sl, uv))
             btn_jump_sched.pack(side="left", padx=2)
             Tooltip(btn_jump_sched, owner_test_btn_tip)
 
-            btn_jump_cancel = ttk.Button(r_btn1, text="Jump Cancelled", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("jump_cancelled", nv, iv, wvs, inv, ov, sl))
+            btn_jump_cancel = ttk.Button(r_btn1, text="Jump Cancelled", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("jump_cancelled", nv, iv, wvs, inv, ov, sl, uv))
             btn_jump_cancel.pack(side="left", padx=2)
             Tooltip(btn_jump_cancel, owner_test_btn_tip)
 
-            btn_jump_complete = ttk.Button(r_btn1, text="Jump Complete", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("jump_complete", nv, iv, wvs, inv, ov, sl))
+            btn_jump_complete = ttk.Button(r_btn1, text="Jump Complete", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("jump_complete", nv, iv, wvs, inv, ov, sl, uv))
             btn_jump_complete.pack(side="left", padx=2)
             Tooltip(btn_jump_complete, owner_test_btn_tip)
 
-            btn_sell_order = ttk.Button(r_btn1, text="Sell Order", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("carrier_sell_order", nv, iv, wvs, inv, ov, sl))
+            btn_sell_order = ttk.Button(r_btn1, text="Sell Order", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("carrier_sell_order", nv, iv, wvs, inv, ov, sl, uv))
             btn_sell_order.pack(side="left", padx=2)
             Tooltip(btn_sell_order, owner_test_btn_tip)
 
-            btn_buy_order = ttk.Button(r_btn1, text="Buy Order", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("carrier_buy_order", nv, iv, wvs, inv, ov, sl))
+            btn_buy_order = ttk.Button(r_btn1, text="Buy Order", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("carrier_buy_order", nv, iv, wvs, inv, ov, sl, uv))
             btn_buy_order.pack(side="left", padx=2)
             Tooltip(btn_buy_order, owner_test_btn_tip)
 
-            r_btn_any_label = ttk.Frame(card)
+            r_btn_any_label = ttk.Frame(tests_box)
             r_btn_any_label.pack(fill="x", expand=True, padx=5, pady=(2, 0))
             ttk.Label(r_btn_any_label, text="Any Commander Tests:", font=("Helvetica", 8, "bold")).pack(side="left")
 
-            r_btn2 = ttk.Frame(card)
+            r_btn2 = ttk.Frame(tests_box)
             r_btn2.pack(fill="x", expand=True, padx=5, pady=(0, 4))
 
-            btn_tritium = ttk.Button(r_btn2, text="Tritium Deposited", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("tritium_deposited", nv, iv, wvs, inv, ov, sl))
+            btn_tritium = ttk.Button(r_btn2, text="Tritium Deposited", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("tritium_deposited", nv, iv, wvs, inv, ov, sl, uv))
             btn_tritium.pack(side="left", padx=2)
             Tooltip(btn_tritium, test_btn_tip)
 
-            btn_trade_sale = ttk.Button(r_btn2, text="Trade Sale", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("trade_sale", nv, iv, wvs, inv, ov, sl))
+            btn_trade_sale = ttk.Button(r_btn2, text="Trade Sale", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("trade_sale", nv, iv, wvs, inv, ov, sl, uv))
             btn_trade_sale.pack(side="left", padx=2)
             Tooltip(btn_trade_sale, test_btn_tip)
 
-            btn_trade_purchase = ttk.Button(r_btn2, text="Trade Purchase", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("trade_purchase", nv, iv, wvs, inv, ov, sl))
+            btn_trade_purchase = ttk.Button(r_btn2, text="Trade Purchase", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("trade_purchase", nv, iv, wvs, inv, ov, sl, uv))
             btn_trade_purchase.pack(side="left", padx=2)
             Tooltip(btn_trade_purchase, test_btn_tip)
 
-            btn_cartographics = ttk.Button(r_btn2, text="Cartographics", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("cartographics", nv, iv, wvs, inv, ov, sl))
+            btn_cartographics = ttk.Button(r_btn2, text="Cartographics", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("cartographics", nv, iv, wvs, inv, ov, sl, uv))
             btn_cartographics.pack(side="left", padx=2)
             Tooltip(btn_cartographics, test_btn_tip)
 
-            btn_exobiology = ttk.Button(r_btn2, text="Exobiology", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl: run_single_test("exobiology", nv, iv, wvs, inv, ov, sl))
+            btn_exobiology = ttk.Button(r_btn2, text="Exobiology", width=14, command=lambda nv=v_name, iv=v_id, wvs=webhook_vars, inv=v_inara, ov=v_owner, sl=status_lbl, uv=v_use_inara: run_single_test("exobiology", nv, iv, wvs, inv, ov, sl, uv))
             btn_exobiology.pack(side="left", padx=2)
             Tooltip(btn_exobiology, test_btn_tip)
+
+            tests_section.apply_mode(layout["compact"])
+            card_ctls.append(tests_section)
 
             carrier_rows.append({
                 "v_id": v_id,
@@ -2084,13 +2444,17 @@ def plugin_prefs(notebook, cmdr, is_beta):
                 "v_name": v_name,
                 "webhook_vars": webhook_vars,
                 "v_inara": v_inara,
-                "v_owner": v_owner
+                "v_owner": v_owner,
+                "v_use_inara": v_use_inara,
+                "chk_use_inara": chk_use_inara
             })
             card_idx += 1
 
+        if layout["ready"]:
+            _relayout(True)
+
     render_carrier_cards()
     carriers_canvas.update_idletasks()
-    _size_viewport()
     carriers_canvas.yview_moveto(0)
 
     def add_new_carrier():
@@ -2101,15 +2465,204 @@ def plugin_prefs(notebook, cmdr, is_beta):
         while new_key in carriers_dict:
             idx += 1
             new_key = f"NEW{idx}"
-        carriers_dict[new_key] = {"name": "New Fleet Carrier", "numeric_id": "", "webhooks": [""], "inara_url": "", "owner_cmdr": ""}
+        carriers_dict[new_key] = {"name": "New Fleet Carrier", "numeric_id": "", "webhooks": [""], "inara_url": "", "owner_cmdr": "", "use_inara_image": True}
         render_carrier_cards()
 
-    btn_add = ttk.Button(frame, text="+ Add Fleet Carrier", command=add_new_carrier)
+    btn_add = ttk.Button(body, text="+ Add Fleet Carrier", command=add_new_carrier)
     btn_add.grid(row=3, column=0, sticky="w", padx=10, pady=10)
     Tooltip(btn_add, "Add a new Fleet Carrier to track.")
 
-    _build_updates_section(frame)   # row 4, below every existing control
+    _build_updates_section(frame, body)   # row 4, below every existing control
 
+    # ------------------------------------------------------------------
+    # Small-screen layout. A pass measures EDMC's furniture around the tab ("chrome"), what the
+    # screen leaves for the tab, and the tab's fixed parts, then sizes the card list to that
+    # (between 1.5 cards and VISIBLE_CARDS cards). If even 1.5 cards do not fit it switches to the
+    # compact layout, and if that does not fit either the outer scroll area takes the overflow.
+    # ------------------------------------------------------------------
+    def _tallest_tab():
+        """The height the enclosing Notebook asks for, which is its TALLEST tab's (ours included), so a taller
+        sibling tab (EDMC's own Configuration tab) is not mistaken for dialog furniture. None when this frame is
+        not a tab of a Notebook (yet), or anything about the walk fails."""
+        try:
+            w = frame
+            for _ in range(20):
+                parent_path = w.winfo_parent()
+                if not parent_path:
+                    return None
+                parent = w.nametowidget(parent_path)
+                if isinstance(parent, ttk.Notebook):
+                    tabs = [str(t) for t in parent.tabs()]
+                    if str(w) not in tabs:
+                        return None
+                    tallest = frame.winfo_reqheight()
+                    for t in tabs:
+                        try:
+                            tallest = max(tallest, parent.nametowidget(t).winfo_reqheight())
+                        except (TclError, KeyError, RuntimeError):
+                            pass        # a tab that vanished under us is simply not counted
+                    return tallest
+                w = parent
+        except (TclError, KeyError, RuntimeError, AttributeError):
+            pass
+        return None
+
+    def _chrome():
+        tallest = _tallest_tab()
+        if tallest is None:
+            tallest = frame.winfo_reqheight()       # not in a Notebook (yet): the plain formula
+        c = frame.winfo_toplevel().winfo_reqheight() - tallest
+        return c if c > 0 else ESTIMATED_CHROME     # not embedded in a dialog yet: use the estimate
+
+    def _card_metrics():
+        body.update_idletasks()     # request sizes are stale until geometry has settled
+        cards = carriers_container.winfo_children()
+        card_h = (max(c.winfo_reqheight() for c in cards) + 10) if cards else 0   # + the grid pady
+        return len(cards), card_h
+
+    def _fixed_height():
+        body.update_idletasks()
+        return body.winfo_reqheight() - carriers_canvas.winfo_reqheight()
+
+    def _set_compact(on):
+        layout["compact"] = bool(on)
+        if on:
+            chk_enabled.grid_configure(columnspan=1)
+            btn_add.grid_configure(row=0, column=1, padx=10, pady=5)
+            lbl_title.grid_remove()
+        else:
+            chk_enabled.grid_configure(columnspan=2)
+            btn_add.grid_configure(row=3, column=0, padx=10, pady=10)
+            lbl_title.grid()
+        _grid_updates_section(frame, on)
+        for ctl in card_ctls:
+            ctl.apply_mode(on)
+
+    def _normal_layout_fits(usable):
+        n, card_h = _card_metrics()
+        avail = usable - _fixed_height()
+        return avail >= (MIN_VISIBLE_CARDS * card_h if n else MIN_EMPTY_VIEWPORT)
+
+    def _apply_budget(usable):
+        n, card_h = _card_metrics()
+        now = carriers_canvas.winfo_reqheight()
+        fixed = _fixed_height()
+        avail = usable - fixed
+        if n:
+            floor_px = -(-(MIN_VISIBLE_CARDS * card_h) // 1)        # round UP: 1.5 x an odd card height is a half pixel
+            vp = int(max(floor_px, min(VISIBLE_CARDS * card_h, avail)))
+        else:
+            vp = int(max(MIN_EMPTY_VIEWPORT, min(300, avail)))
+        if vp != now:
+            carriers_canvas.configure(height=vp)
+        content_h = fixed + vp
+        content_w = body.winfo_reqwidth()
+        active = content_h > usable
+        outer_h = max(MIN_OUTER_HEIGHT, min(content_h, usable)) if active else content_h
+        outer_canvas.configure(width=content_w, height=outer_h, scrollregion=(0, 0, content_w, content_h))
+        if active != layout["sb_shown"]:
+            if active:
+                outer_scrollbar.grid(row=0, column=1, sticky="ns")
+            else:
+                outer_scrollbar.grid_remove()
+                outer_canvas.yview_moveto(0)
+            layout["sb_shown"] = active
+        layout["outer_active"] = active
+        layout["viewport"] = vp
+        if not active:
+            _release_outer_wheel()
+
+    def _relayout(full=False):
+        """One layout pass. full=True also re-decides normal versus compact. Never raises into Tk."""
+        # Defensive (2026-09-25): removing this re-entrancy guard changes no observable result in the suites (the
+        # geometry Configure events it protects against settle to the same layout), so it is deliberately not pinned.
+        if layout["busy"]:
+            return
+        layout["busy"] = True
+        try:
+            frame.update_idletasks()
+            usable = _screen_height(frame) - OS_MARGIN - _chrome()
+            if full:
+                was_compact = layout["compact"]
+                kept = [ctl.expanded for ctl in card_ctls]
+                if was_compact:
+                    _set_compact(False)
+                if not _normal_layout_fits(usable):
+                    _set_compact(True)
+                    if was_compact:
+                        for ctl, expanded in zip(card_ctls, kept):
+                            ctl.set_expanded(expanded, notify=False)
+            _apply_budget(usable)
+        except (TclError, RuntimeError):
+            pass                        # the window was destroyed under us, or is not built yet
+        finally:
+            layout["busy"] = False
+
+    def _run_scheduled():
+        layout["after"] = None
+        _relayout(True)
+
+    def _schedule():
+        if layout["after"] is not None:
+            return
+        try:
+            layout["after"] = frame.after_idle(_run_scheduled)
+        except TclError:
+            pass
+
+    # The outer scroll area takes the wheel while the pointer is anywhere on the tab except over the card
+    # list (which has its own binding above), and only while it is showing its scrollbar.
+    def _pointer_in_tab():
+        try:
+            w = frame.winfo_containing(*frame.winfo_pointerxy())
+        except (TclError, KeyError):
+            return False
+        while w is not None:
+            if w is frame:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _on_outer_wheel(event):
+        outer_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _grab_outer_wheel(_event=None):
+        if layout["outer_active"] and layout["wheel_owner"] != "cards":
+            outer_canvas.bind_all("<MouseWheel>", _on_outer_wheel)
+            layout["wheel_owner"] = "outer"
+
+    def _release_outer_wheel(_event=None):
+        if layout["wheel_owner"] == "outer":
+            outer_canvas.unbind_all("<MouseWheel>")
+            layout["wheel_owner"] = None
+
+    def _on_tab_leave(_event=None):
+        if not _pointer_in_tab():
+            _release_outer_wheel()
+
+    def _on_outer_destroy(event):
+        # Defensive (2026-09-25): destroying the canvas already drops its bind_all in Tk, so removing this changes no
+        # observable result (probed by destroying the outer canvas alone); it is kept as a belt-and-braces unbind.
+        if event.widget is outer_canvas:
+            outer_canvas.unbind_all("<MouseWheel>")
+            layout["wheel_owner"] = None
+
+    frame.bind("<Enter>", _grab_outer_wheel, add="+")
+    frame.bind("<Leave>", _on_tab_leave, add="+")
+    frame.bind("<Map>", lambda e: _schedule() if e.widget is frame else None, add="+")
+    body.bind("<Configure>", lambda e: _relayout(False) if layout["ready"] else None, add="+")
+    outer_canvas.bind("<Destroy>", _on_outer_destroy, add="+")
+
+    layout["ready"] = True
+    _relayout(True)
+    _schedule()     # again once EDMC has put the tab into its dialog and the real chrome can be measured
+
+    frame.carriers_canvas = carriers_canvas
+    frame.outer_canvas = outer_canvas
+    frame.outer_scrollbar = outer_scrollbar
+    frame.layout_state = layout
+    frame.relayout = _relayout
+    frame.tests_sections = card_ctls
     frame.enabled_var = enabled_var
     frame.carrier_rows = carrier_rows
     prefs_changed.frame = frame
@@ -2136,6 +2689,7 @@ def prefs_changed(cmdr, is_beta):
         cname = row["v_name"].get().strip()
         cinara = row["v_inara"].get().strip()
         cowner = row["v_owner"].get().strip()
+        cuse_inara = bool(row["v_use_inara"].get())
 
         wh_list = [var.get().strip() for var in row["webhook_vars"] if var.get().strip()]
 
@@ -2152,6 +2706,7 @@ def prefs_changed(cmdr, is_beta):
                 "numeric_id": cnum_id,
                 "webhooks": wh_list,
                 "inara_url": cinara,
+                "use_inara_image": cuse_inara,
                 "owner_cmdr": cowner
             }
 
@@ -2269,7 +2824,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                                 from_system=carrier_previous_system.get(key) or "Unknown",
                                 destination=arrived_system
                             )
-                            broadcast_surveillance_embed(p["webhooks"], embed, sender_name=p["display_name"], inara_url=p["inara_url"])
+                            broadcast_surveillance_embed(p["webhooks"], embed, sender_name=p["display_name"], inara_url=p["inara_url"], event="jump_complete_remote", carrier=key, use_image=p["use_image"])
                             print(f"[CarrierNavComms] Sent fallback Jump Complete for '{key}' (CarrierJump event never arrived).")
                             with pending_jumps_lock:
                                 pending_jumps.pop(key, None)
@@ -2339,6 +2894,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     matched_carrier_key = None
     display_carrier_name = ""
     matched_inara_url = ""
+    matched_use_image = True
     matched_owner_cmdr = ""
 
     for target_id, cdata in carriers_dict.items():
@@ -2358,6 +2914,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             saved_name = cdata.get("name", "") if isinstance(cdata, dict) else ""
             display_carrier_name = f"{saved_name} ({target_id})" if saved_name else f"Fleet Carrier ({target_id})"
             matched_inara_url = cdata.get("inara_url", "") if isinstance(cdata, dict) else ""
+            matched_use_image = inara_image_enabled(cdata.get("use_inara_image")) if isinstance(cdata, dict) else True
             matched_owner_cmdr = (cdata.get("owner_cmdr", "") if isinstance(cdata, dict) else "").strip()
 
             if event_market_id and not cfg_num_id:
@@ -2414,7 +2971,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             body=entry.get("Body", "Space"),
             jump_timestamp=jump_ts
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="jump_scheduled", carrier=matched_carrier_key, use_image=matched_use_image)
 
         clear_pending_jump(matched_carrier_key)
         with pending_jumps_lock:
@@ -2423,6 +2980,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 "cmdr": cmdr,
                 "display_name": display_carrier_name,
                 "inara_url": matched_inara_url,
+                "use_image": matched_use_image,
                 "webhooks": carrier_wh_list,
                 "timer": None
             }
@@ -2434,7 +2992,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             destination=entry.get("SystemName", "Unknown"),
             current_system=carrier_current_system.get(matched_carrier_key) or system or current_system
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="jump_cancelled", carrier=matched_carrier_key, use_image=matched_use_image)
         clear_pending_jump(matched_carrier_key)
 
     # 3. Carrier Jump Complete
@@ -2445,7 +3003,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             destination=entry.get("StarSystem", system or "Unknown System"),
             body=entry.get("Body", "Space")
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="jump_complete", carrier=matched_carrier_key, use_image=matched_use_image)
         clear_pending_jump(matched_carrier_key)
 
     # 4. Tritium Deposited
@@ -2455,7 +3013,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             "tritium_deposited", cmdr, display_carrier_name,
             quantity=f"{amount:,}"
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="tritium_deposited", carrier=matched_carrier_key, use_image=matched_use_image)
 
     # 5. Market Order Set (Sell or Buy)
     elif event == "CarrierTradeOrder":
@@ -2489,7 +3047,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         else:
             return
 
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="carrier_sell_order" if "SaleOrder" in entry else "carrier_buy_order", carrier=matched_carrier_key, use_image=matched_use_image)
 
     # 6. Market Sales
     elif event == "MarketSell":
@@ -2500,7 +3058,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             "trade_sale", cmdr, display_carrier_name,
             quantity=f"{count:,}", item=item, total_price=f"{total_price:,}"
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="trade_sale", carrier=matched_carrier_key, use_image=matched_use_image)
 
     # 7. Market Purchases
     elif event == "MarketBuy":
@@ -2511,7 +3069,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             "trade_purchase", cmdr, display_carrier_name,
             quantity=f"{count:,}", item=item, total_price=f"{total_price:,}"
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="trade_purchase", carrier=matched_carrier_key, use_image=matched_use_image)
 
     # 8. Exploration Data
     elif event in ["SellExplorationData", "MultiSellExplorationData"]:
@@ -2551,7 +3109,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             first_discoveries=f"{first_discoveries_this_sale:,}", first_mapped=f"{first_mapped_this_sale:,}",
             data_note=data_note
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="cartographics", carrier=matched_carrier_key, use_image=matched_use_image)
 
 # 9. Exobiology Data
     elif event in ["SellMicroData", "SellOrganics", "SellOrganicData"]:
@@ -2577,4 +3135,4 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             "exobiology", cmdr, display_carrier_name,
             total_earned=f"{total_earned:,}", first_discoveries=f"{first_discoveries:,}"
         )
-        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url)
+        broadcast_surveillance_embed(carrier_wh_list, embed, sender_name=display_carrier_name, inara_url=matched_inara_url, event="exobiology", carrier=matched_carrier_key, use_image=matched_use_image)

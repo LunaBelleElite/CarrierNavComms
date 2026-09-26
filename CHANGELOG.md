@@ -1,5 +1,13 @@
 # Changelog
 
+## ver-1.2.0.0 - 2026-09-26
+
+- When a message doesn't reach Discord, you can now see why. The reason (Discord's own words, a rate-limit wait, a timeout, or "could not connect") is recorded by channel number, never your webhook address, in three places: a **Last post** line in the plugin's settings tab, `post-failures.log` in the plugin's folder, and EDMC's own log.
+- Nothing is retried automatically: a failed message stays failed, so fix the webhook and press a test button to check it.
+- Each carrier has a new **Use Inara image** switch. Turn it off and that carrier's messages skip the Inara lookup and carry no picture, so more of them fit on screen in a busy channel. The Inara link in the heading stays. It's on by default, so carriers you already have keep their picture.
+- The settings box fits smaller screens. When space is short it switches to a compact layout that shows at least one and a half carriers, with each carrier's test buttons behind a **Send test messages** toggle. It has been checked on simulated screen sizes only, not on a real small monitor.
+- Installs on 1.1.0.0 or newer will offer this through the **Check for updates** button.
+
 ## ver-1.1.0.3 - 2026-09-25
 
 - The **Check for updates** restart is safer and explains itself. On a couple of occasions EDMC closed after an update and didn't reopen, so the restart now:
