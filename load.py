@@ -24,7 +24,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.2.1.0"
+PLUGIN_VERSION = "ver-1.2.1.1"
 
 try:
     from config import config as edmc_config
@@ -1058,8 +1058,123 @@ class UpdateError(Exception):
     """An update step refused or failed; the message is meant for the user."""
 
 
+def _path_text(value):
+    """A folder given as a str or a pathlib.Path (EDMC passes a Path) as a plain str; "" when it is empty or not a path."""
+    try:
+        return os.fsdecode(os.fspath(value)) if value else ""
+    except Exception:
+        return ""
+
+
+def plugin_dir_candidates():
+    """Where the plugin's own folder may be, as ordered (label, path) pairs with no duplicates: the test hook,
+    what EDMC handed to plugin_start3, and the folder of the file that is actually running."""
+    found, seen = [], set()
+    for label, value in (("override", PLUGIN_DIR_OVERRIDE), ("EDMC", _plugin_dir),
+                         ("running file", os.path.dirname(os.path.abspath(__file__)))):
+        path = _path_text(value)
+        if not path:
+            continue
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append((label, path))
+    return found
+
+
+def _has_load_py(folder):
+    """True when folder holds a load.py that is a real, readable file (not a folder of that name)."""
+    path = os.path.join(folder, "load.py")
+    try:
+        if not os.path.isfile(path):
+            return False
+        with open(path, "rb"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def describe_plugin_dir():
+    """(chosen folder, its label or None, whether it holds a load.py). The first candidate that holds a load.py
+    is chosen; when none does, the first candidate is returned so callers can fail cleanly."""
+    candidates = plugin_dir_candidates()
+    for label, path in candidates:
+        if _has_load_py(path):
+            return path, label, True
+    return candidates[0][1], None, False
+
+
 def get_plugin_dir():
-    return PLUGIN_DIR_OVERRIDE or _plugin_dir or os.path.dirname(os.path.abspath(__file__))
+    return describe_plugin_dir()[0]
+
+
+def missing_plugin_dir_message():
+    tried = "; ".join("%s: %s" % pair for pair in plugin_dir_candidates())
+    return ("Could not find the plugin's own load.py, so nothing was changed. Looked in: %s. "
+            "Please reinstall the plugin by hand." % tried)
+
+
+def _resolve_plugin_dir_or_raise():
+    folder, _label, present = describe_plugin_dir()
+    if not present:
+        raise UpdateError(missing_plugin_dir_message())
+    return folder
+
+
+UPDATE_LOG_NAME = "update.log"
+UPDATE_LOG_CAP = 32 * 1024             # bytes; at write time a full log is renamed to .old (or, if that fails, started over)
+_update_log_lock = threading.Lock()
+
+
+def update_log_path():
+    """Where update.log goes: beside the plugin, or the temp folder when no usable plugin folder is known."""
+    folder, _label, present = describe_plugin_dir()
+    return os.path.join(folder if present else tempfile.gettempdir(), UPDATE_LOG_NAME)
+
+
+def _write_update_log(text):
+    """Appends one 'YYYY-MM-DD HH:MM:SS  text' line to update.log, rotating at the cap. Never raises.
+    The text is redacted and put on one line; callers never pass config contents."""
+    try:
+        line = "%s  %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), _clean_text(text, limit=1500))
+        data = line.encode("utf-8", errors="replace")[-UPDATE_LOG_CAP:]
+        with _update_log_lock:
+            path = update_log_path()
+            mode = "ab"
+            try:
+                if os.path.getsize(path) + len(data) > UPDATE_LOG_CAP:
+                    try:
+                        os.replace(path, path + ".old")
+                    except OSError:
+                        mode = "wb"                 # cannot rotate: start the live log over, never grow past the cap
+            except OSError:
+                pass
+            with open(path, mode) as f:
+                f.write(data)
+    except Exception:
+        pass
+
+
+def _update_failed(message):
+    """Records a failure, with the exact user-facing message, in update.log and as one line in EDMC's log."""
+    _write_update_log("update failed: %s" % message)
+    try:
+        print("[CarrierNavComms] update failed: %s" % message)
+    except Exception:
+        pass
+
+
+def _log_update_check_start():
+    """Logs where the plugin folder was found and every candidate. Returns the clear error text when no candidate
+    holds a load.py, else None."""
+    folder, label, present = describe_plugin_dir()
+    _write_update_log("update check started: plugin folder %s (source: %s), load.py present: %s"
+                      % (folder, label or "none", "yes" if present else "no"))
+    for cand_label, path in plugin_dir_candidates():
+        _write_update_log("candidate %s: %s (%s)" % (cand_label, path, "load.py found" if _has_load_py(path) else "no load.py"))
+    return None if present else missing_plugin_dir_message()
 
 
 def parse_version(tag):
@@ -1343,7 +1458,7 @@ def _purge_bytecode(plugin_dir):
 
 def apply_update(new_load_bytes, plugin_dir=None):
     """Backs up load.py to load.py.bak, then swaps the new one in. On any error the old one is restored."""
-    d = plugin_dir or get_plugin_dir()
+    d = plugin_dir or _resolve_plugin_dir_or_raise()
     load_path = os.path.join(d, "load.py")
     backup = load_path + ".bak"
     original = None
@@ -1363,6 +1478,9 @@ def apply_update(new_load_bytes, plugin_dir=None):
                     _purge_bytecode(d)
         except Exception:
             pass
+        if isinstance(e, FileNotFoundError):
+            raise UpdateError("Could not install the new load.py: %s was not found. Nothing was changed."
+                              % (e.filename or "a file the update needs"))
         raise UpdateError("Could not install the new load.py (%s). The previous version was kept." % e)
 
 
@@ -1551,7 +1669,7 @@ def rebuild_user_config(release_config, plugin_dir=None, now=None, _tamper=None)
 def perform_update(bundle, plugin_dir=None, _tamper=None):
     """Installs a verified bundle: load.py first, then the config, rolling load.py back if the config fails."""
     with _perform_lock:                     # one install at a time, whoever calls
-        d = plugin_dir or get_plugin_dir()
+        d = plugin_dir or _resolve_plugin_dir_or_raise()
         tag = bundle["tag"]
         if not is_newer(tag, PLUGIN_VERSION):
             raise UpdateError("Not installing %s: it is not newer than the installed %s." % (tag, PLUGIN_VERSION))
@@ -1641,16 +1759,24 @@ def _powershell_exe():
 RESTART_LOG_NAME = "restart-helper.log"
 
 
+def _log_folder():
+    """The folder for the restart and failed-post logs: the first candidate (override, EDMC, running file) that is
+    a real folder, else the temp folder. A load.py is not required, but a folder that is not there is skipped,
+    so a wrong folder reported by EDMC cannot swallow the logs."""
+    for _label, path in plugin_dir_candidates():
+        if os.path.isdir(path):
+            return path
+    return tempfile.gettempdir()
+
+
 def restart_log_path():
     """Where the restart helper writes its log: beside the plugin, or the temp folder if that is unknown."""
-    d = PLUGIN_DIR_OVERRIDE or _plugin_dir or tempfile.gettempdir()
-    return os.path.join(d, RESTART_LOG_NAME)
+    return os.path.join(_log_folder(), RESTART_LOG_NAME)
 
 
 def post_log_path():
     """Where failed posts are logged: beside the plugin, or the temp folder if that is unknown."""
-    d = PLUGIN_DIR_OVERRIDE or _plugin_dir or tempfile.gettempdir()
-    return os.path.join(d, POST_LOG_NAME)
+    return os.path.join(_log_folder(), POST_LOG_NAME)
 
 
 def build_restart_helper(pid, exe, args, cwd=None, timeout=60, log_path=None):
@@ -1805,6 +1931,15 @@ def _start_update_check(frame, button, status_var):
     if not _update_flow_lock.acquire(blocking=False):
         _tk_safe(lambda: status_var.set("An update is already in progress."))
         return
+    try:
+        problem = _log_update_check_start()      # before any network call: no usable plugin folder means no update
+    except Exception:
+        problem = None
+    if problem:
+        _update_failed(problem)
+        _tk_safe(lambda: status_var.set(problem))
+        _update_flow_lock.release()
+        return
     results = queue.Queue()
     released = []
 
@@ -1815,19 +1950,30 @@ def _start_update_check(frame, button, status_var):
 
     def check_worker():
         try:
-            results.put(("checked", fetch_latest_release()))
+            info = fetch_latest_release()
+            _write_update_log("latest release tag: %s" % info.get("tag"))
+            results.put(("checked", info))
         except UpdateError as e:
+            _update_failed(str(e))
             results.put(("done", str(e)))
         except Exception as e:
-            results.put(("done", "Unexpected error while checking: %s" % e))
+            message = "Unexpected error while checking: %s" % e
+            _update_failed(message)
+            results.put(("done", message))
 
     def install_worker(release_info):
         try:
-            results.put(("installed", perform_update(download_and_verify(release_info))))
+            _write_update_log("install started: %s into %s" % (release_info.get("tag"), get_plugin_dir()))
+            done = perform_update(download_and_verify(release_info))
+            _write_update_log("install finished: %s" % done)
+            results.put(("installed", done))
         except UpdateError as e:
+            _update_failed(str(e))
             results.put(("done", str(e)))
         except Exception as e:
-            results.put(("done", "Unexpected error while updating: %s" % e))
+            message = "Unexpected error while updating: %s" % e
+            _update_failed(message)
+            results.put(("done", message))
 
     def finish(message):
         _tk_safe(lambda: status_var.set(message))
@@ -1853,6 +1999,8 @@ def _start_update_check(frame, button, status_var):
         if kind == "installed":
             _tk_safe(lambda: status_var.set(payload + " Restarting EDMC..."))
             started, message = restart_edmc()
+            if not started:
+                _write_update_log("restart not started: %s" % message)
             return finish(payload if started else payload + " " + message)
         return finish("Unexpected update state.")
 
@@ -1960,7 +2108,7 @@ def _grid_updates_section(frame, compact):
 def plugin_start3(plugin_dir):
     """Initializes plugin at EDMC startup."""
     global _plugin_dir
-    _plugin_dir = plugin_dir or None
+    _plugin_dir = _path_text(plugin_dir) or None     # EDMC passes a pathlib.Path
     deep_scan_journals_for_carrier_ids()
     seed_carrier_systems_from_logs()
     seed_dock_state_from_logs()

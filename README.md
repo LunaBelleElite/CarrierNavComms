@@ -120,6 +120,8 @@ looks up the latest release. Nothing goes online until you click.
   it did to `restart-helper.log` in the plugin folder. Elsewhere it installs
   and asks you to restart.
 
+If it can't find its own `load.py`, it says where it looked and changes nothing.
+It writes what it did to `update.log` in the plugin folder.
 It needs nothing beyond GitHub and updates only from the
 `LunaBelleElite/CarrierNavComms` releases. GitHub allows 60 anonymous requests
 an hour, and you're told when they're used up. A copy older than the button

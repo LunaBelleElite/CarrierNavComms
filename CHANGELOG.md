@@ -1,5 +1,12 @@
 # Changelog
 
+## ver-1.2.1.1 - 2026-09-26
+
+- **Check for updates** now finds the plugin's own `load.py` even if EDMC reports a different folder for it. If it still can't find one, it tells you where it looked and changes nothing, instead of showing a raw "No such file" error.
+- A new `update.log` in the plugin's folder records what the update button did, so a failure can be traced. It never contains your webhook addresses or settings.
+- The failed-post log and the restart log are no longer lost when EDMC reports a different folder.
+- If **Check for updates** on your current version shows a "No such file" error, that version can't update itself: update once by hand (see the release notes). Everyone else can update with the button as usual.
+
 ## ver-1.2.1.0 - 2026-09-26
 
 - The settings box now opens fully in view. If EDMC opens it partly off the bottom or the side of the screen, it is moved back on screen, title bar and OK/Cancel row included, and kept clear of the taskbar. It is never resized, and a box you drag yourself is left alone.
