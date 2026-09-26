@@ -69,7 +69,7 @@ it reports comes from your own Elite Dangerous journals.
    your Discord channel, with the carrier's picture if you gave an Inara link.
 
 The settings box adapts to the room it has: on a short screen it goes compact
-and tucks each carrier's test buttons behind a **Send test messages** toggle.
+and tucks each carrier's test buttons behind a **Send test messages** toggle, and it moves itself fully into view when it opens.
 
 ## Each carrier can drop the picture
 

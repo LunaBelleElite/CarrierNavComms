@@ -1,5 +1,11 @@
 # Changelog
 
+## ver-1.2.1.0 - 2026-09-26
+
+- The settings box now opens fully in view. If EDMC opens it partly off the bottom or the side of the screen, it is moved back on screen, title bar and OK/Cancel row included, and kept clear of the taskbar. It is never resized, and a box you drag yourself is left alone.
+- It has been checked on a simulated small screen and on one real desktop, not inside EDMC on a small monitor.
+- Installs on 1.1.0.0 or newer will offer this through the **Check for updates** button.
+
 ## ver-1.2.0.0 - 2026-09-26
 
 - When a message doesn't reach Discord, you can now see why. The reason (Discord's own words, a rate-limit wait, a timeout, or "could not connect") is recorded by channel number, never your webhook address, in three places: a **Last post** line in the plugin's settings tab, `post-failures.log` in the plugin's folder, and EDMC's own log.

@@ -24,7 +24,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.2.0.0"
+PLUGIN_VERSION = "ver-1.2.1.0"
 
 try:
     from config import config as edmc_config
@@ -1993,6 +1993,11 @@ MIN_VISIBLE_CARDS = 1.5     # the card list always shows at least this many card
 MIN_OUTER_HEIGHT = 120      # the whole-tab scroll area is never squeezed below this
 MIN_EMPTY_VIEWPORT = 60     # with no carriers the (empty) list area may shrink to this on a short screen
 SCREEN_HEIGHT_OVERRIDE = None   # test hook: a number replaces winfo_screenheight()
+WORK_AREA_OVERRIDE = None       # test hook: a (left, top, right, bottom) tuple replaces the measured work area
+NUDGE_DEBOUNCE_MS = 50          # a resize of the dialog by one of our own actions is nudged this long after it
+NUDGE_SETTLE_TRIES = 20         # after the map, how many times to wait for the dialog's size to stop changing
+SPI_GETWORKAREA = 0x30
+MONITOR_DEFAULTTONEAREST = 2
 
 
 def _screen_height(widget):
@@ -2000,6 +2005,106 @@ def _screen_height(widget):
     if SCREEN_HEIGHT_OVERRIDE:
         return int(SCREEN_HEIGHT_OVERRIDE)
     return int(widget.winfo_screenheight())
+
+
+def _load_user32():
+    """The Windows user32 library, or None when this Python has no Windows API (a separate handle, so the
+    argument types set on it never touch anyone else's ctypes.windll.user32)."""
+    import ctypes
+    if not hasattr(ctypes, "windll"):
+        return None
+    return ctypes.WinDLL("user32")
+
+
+def _work_area(widget):
+    """(left, top, right, bottom) of the monitor work area (screen minus taskbar) the widget's window is on,
+    as ints in Tk's own coordinate space. The test hook wins; then Windows monitor info, then the Windows
+    work area, then the plain screen rectangle. Never raises."""
+    try:
+        if WORK_AREA_OVERRIDE:
+            left, top, right, bottom = WORK_AREA_OVERRIDE
+            return (int(left), int(top), int(right), int(bottom))
+    except (TypeError, ValueError):
+        pass
+    try:
+        screen = (0, 0, int(widget.winfo_screenwidth()), int(widget.winfo_screenheight()))
+    except Exception:
+        return (0, 0, 0, 0)        # callers treat an empty rectangle as "cannot tell"
+    if sys.platform != "win32":
+        return screen
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = _load_user32()
+        if user32 is None:
+            return screen
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+        user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+        user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+        wid = widget.winfo_toplevel().winfo_id()
+        hwnd = user32.GetParent(wid) or wid          # Tk's toplevel id is the inner window; the OS frame is its parent
+        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if monitor:
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                rect = (int(info.rcWork.left), int(info.rcWork.top), int(info.rcWork.right), int(info.rcWork.bottom))
+                if rect[2] > rect[0] and rect[3] > rect[1]:
+                    return rect
+        rc = RECT()
+        if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rc), 0):
+            rect = (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))
+            if rect[2] > rect[0] and rect[3] > rect[1]:
+                return rect
+    except Exception:
+        pass                        # any failure at all: the screen rectangle
+    return screen
+
+
+def _nudge_on_screen(top):
+    """Move (never resize) a mapped toplevel by the smallest amount that brings its whole OUTER rectangle
+    (title bar to bottom border) inside the work area; the top edge is never moved above the work area, so the
+    title bar stays reachable. Returns 'inside', 'moved', 'taller-than-work-area' (aligned to the top, the bottom
+    still overhangs) or 'skipped' (not mapped, cannot measure, or any error). Never raises."""
+    try:
+        if not top.winfo_viewable():        # asked first: update_idletasks would MAP a window that is still waiting to be
+            return "skipped"                # shown, and a withdrawn one has no position to measure
+        top.update_idletasks()
+        left, up, right, bottom = _work_area(top)
+        if right <= left or bottom <= up:
+            return "skipped"
+        x, y = top.winfo_x(), top.winfo_y()
+        border = top.winfo_rootx() - x
+        title = top.winfo_rooty() - y
+        if border < 0 or title < 0:
+            return "skipped"
+        outer_w = top.winfo_width() + 2 * border
+        outer_h = top.winfo_height() + title + border
+        new_x = max(min(x, right - outer_w), left)
+        new_y = max(min(y, bottom - outer_h), up)
+        status = "inside"
+        if (new_x, new_y) != (x, y):
+            top.geometry("+%d+%d" % (new_x, new_y))
+            status = "moved"
+        if outer_h > bottom - up:
+            status = "taller-than-work-area"
+        return status
+    except (TclError, RuntimeError, AttributeError, OSError, ValueError, TypeError):
+        return "skipped"
 
 
 class _TestsSection:
@@ -2117,7 +2222,8 @@ def plugin_prefs(notebook, cmdr, is_beta):
     # State of the small-screen layout (see _relayout below). The card height is measured at
     # runtime rather than hardcoded -- it depends on the EDMC theme, font, and display scaling.
     layout = {"compact": False, "outer_active": False, "viewport": None, "ready": False,
-              "after": None, "busy": False, "sb_shown": False, "wheel_owner": None}
+              "after": None, "busy": False, "sb_shown": False, "wheel_owner": None,
+              "nudge": None, "nudge_busy": False, "nudge_after": None, "map_nudged": False, "nudge_sig": None, "settle_after": None}
     card_ctls = []      # one _TestsSection per card
     section_by_status = {}      # a card's status label -> its _TestsSection (the test lambdas already pass the label)
 
@@ -2337,7 +2443,7 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
             # The two rows of test buttons live in tests_box so the small-screen layout can fold them away.
             tests_box = ttk.Frame(card)
-            tests_section = _TestsSection(tests_box, r1b, status_lbl, lambda: _relayout(False))
+            tests_section = _TestsSection(tests_box, r1b, status_lbl, lambda: _on_tests_toggled())
             section_by_status[status_lbl] = tests_section
 
             def run_single_test(embed_key, name_var, id_var, wh_list_vars, inara_var, owner_var, lbl, use_var):
@@ -2452,6 +2558,7 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
         if layout["ready"]:
             _relayout(True)
+            _request_nudge()        # an added or deleted card changes the dialog's height
 
     render_carrier_cards()
     carriers_canvas.update_idletasks()
@@ -2598,9 +2705,79 @@ def plugin_prefs(notebook, cmdr, is_beta):
         finally:
             layout["busy"] = False
 
+    def _nudge():
+        """Keep the dialog inside the work area (see _nudge_on_screen). Never raises into Tk."""
+        if layout["nudge_busy"]:
+            return layout["nudge"]
+        layout["nudge_busy"] = True
+        try:
+            status = _nudge_on_screen(frame.winfo_toplevel())
+        except (TclError, RuntimeError, AttributeError, OSError):
+            status = "skipped"
+        finally:
+            layout["nudge_busy"] = False
+        layout["nudge"] = status
+        return status
+
+    def _run_nudge_later():
+        layout["nudge_after"] = None
+        _nudge()
+
+    def _request_nudge():
+        """One of our own actions may have grown the dialog: nudge shortly after, coalescing bursts."""
+        if layout["nudge_after"] is not None:
+            return
+        try:
+            layout["nudge_after"] = frame.after(NUDGE_DEBOUNCE_MS, _run_nudge_later)
+        except (TclError, RuntimeError):
+            pass
+
+    def _on_tests_toggled():
+        _relayout(False)
+        _request_nudge()
+
+    def _first_nudge(tries=0):
+        # Only once: after the first pass that could actually measure a mapped dialog. Later Map events (tab
+        # switches) and every Configure leave a dialog the user has placed alone. The layout passes that follow
+        # the map keep resizing the dialog for a moment, so wait (bounded) until its requested size stops changing.
+        layout["settle_after"] = None
+        if layout["map_nudged"]:
+            return
+        try:
+            top = frame.winfo_toplevel()
+            top.update_idletasks()
+            sig = (top.winfo_reqwidth(), top.winfo_reqheight(), top.winfo_width(), top.winfo_height())
+            if sig != layout["nudge_sig"] and tries < NUDGE_SETTLE_TRIES:
+                layout["nudge_sig"] = sig
+                layout["settle_after"] = frame.after(NUDGE_DEBOUNCE_MS, lambda: _first_nudge(tries + 1))
+                return
+        except (TclError, RuntimeError, AttributeError):
+            return
+        if _nudge() != "skipped":
+            layout["map_nudged"] = True
+
     def _run_scheduled():
         layout["after"] = None
         _relayout(True)
+        if not layout["map_nudged"]:
+            try:
+                if layout["settle_after"] is None:
+                    layout["settle_after"] = frame.after_idle(_first_nudge)      # behind whatever the relayout just queued
+            except (TclError, RuntimeError):
+                pass
+
+    def _cancel_nudge(event):
+        # A timer left pending on a destroyed tab can fire later into a recycled Tcl command name (tkinter names
+        # commands by object id), so every timer the nudge owns is cancelled when the tab goes.
+        if event.widget is not frame:
+            return
+        for key in ("nudge_after", "settle_after"):
+            if layout[key] is not None:
+                try:
+                    frame.after_cancel(layout[key])
+                except (TclError, RuntimeError, ValueError):
+                    pass
+                layout[key] = None
 
     def _schedule():
         if layout["after"] is not None:
@@ -2650,6 +2827,12 @@ def plugin_prefs(notebook, cmdr, is_beta):
     frame.bind("<Enter>", _grab_outer_wheel, add="+")
     frame.bind("<Leave>", _on_tab_leave, add="+")
     frame.bind("<Map>", lambda e: _schedule() if e.widget is frame else None, add="+")
+    frame.bind("<Destroy>", _cancel_nudge, add="+")
+    try:
+        _dialog = frame.winfo_toplevel()      # the dialog can appear while another tab is showing
+        _dialog.bind("<Map>", lambda e: _schedule() if e.widget is _dialog else None, add="+")
+    except (TclError, RuntimeError):
+        pass
     body.bind("<Configure>", lambda e: _relayout(False) if layout["ready"] else None, add="+")
     outer_canvas.bind("<Destroy>", _on_outer_destroy, add="+")
 
@@ -2662,6 +2845,7 @@ def plugin_prefs(notebook, cmdr, is_beta):
     frame.outer_scrollbar = outer_scrollbar
     frame.layout_state = layout
     frame.relayout = _relayout
+    frame.nudge_on_screen = _nudge
     frame.tests_sections = card_ctls
     frame.enabled_var = enabled_var
     frame.carrier_rows = carrier_rows
