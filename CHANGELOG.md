@@ -1,5 +1,14 @@
 # Changelog
 
+## ver-1.1.0.3 - 2026-09-25
+
+- The **Check for updates** restart is safer and explains itself. On a couple of occasions EDMC closed after an update and didn't reopen, so the restart now:
+  - keeps a small log, `restart-helper.log`, in the plugin's folder, of what it did;
+  - checks that EDMC actually came back, and tries once more if it didn't;
+  - won't try to restart while EDMC is already closing.
+- If EDMC ever fails to come back, that log shows what happened, and it's shown in EDMC's own log at the next start.
+- Installs on 1.1.0.0 or newer will offer this through the **Check for updates** button.
+
 ## ver-1.1.0.2 - 2026-09-25
 
 - Added issue forms for bug reports and ideas on the repository's Issues page, so it's clearer what to include.

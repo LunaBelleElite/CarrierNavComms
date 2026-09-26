@@ -13,6 +13,7 @@ import io
 import queue
 import shutil
 import subprocess
+import tempfile
 import tokenize
 import urllib.error
 import urllib.parse
@@ -22,7 +23,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.1.0.2"
+PLUGIN_VERSION = "ver-1.1.0.3"
 
 try:
     from config import config as edmc_config
@@ -1387,13 +1388,47 @@ def perform_update(bundle, plugin_dir=None, _tamper=None):
 # U+2019, U+201A and U+201B as single quotes as well, so any quoting scheme that builds script text from
 # data can be broken out of (command injection, or a helper that fails after EDMC was told to quit).
 # Every value therefore travels in an environment variable of the helper process instead.
+# The script also writes a log (CNC_LOG), verifies the launch and retries once:
+#  - every log write is wrapped, so a log problem can never stop the restart;
+#  - a log over 32 KB is renamed to <log>.old at start (replacing an older one);
+#  - it never starts a second copy: before each launch it looks for another process with the same executable
+#    name (other than the old pid) and, if there is one, launches nothing and finishes as success;
+#  - after a launch it waits 6 s and checks that a process of that name is running besides the old pid; if not,
+#    it waits 2 s and tries exactly once more, then gives up (exit 3). A launch that throws counts the same.
+#  - EDMC still alive after the timeout: exit 1, nothing launched. Any unexpected error is logged (exit 4).
+# The text has no double quote and no newline, because it travels as one -Command argument.
 _RESTART_SCRIPT = (
-    "Wait-Process -Id ([int]$env:CNC_PID) -Timeout ([int]$env:CNC_TIMEOUT) -ErrorAction SilentlyContinue; "
-    "if (Get-Process -Id ([int]$env:CNC_PID) -ErrorAction SilentlyContinue) { exit 1 }; "
-    "$sp = @{ FilePath = $env:CNC_EXE }; "
+    "$oldPid = [int]$env:CNC_PID; "
+    "$exeName = [IO.Path]::GetFileNameWithoutExtension($env:CNC_EXE); "
+    "function L($m) { try { [IO.File]::AppendAllText($env:CNC_LOG, ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + $m + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false))) } catch { } }; "
+    "function Others { @(Get-Process -Name ([WildcardPattern]::Escape($exeName)) -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $oldPid }) }; "
+    "function Launch { "
+    "$o = @(Others); "
+    "if ($o.Count -gt 0) { L ('already running (pid ' + (($o | ForEach-Object { $_.Id }) -join ',') + '), not launching'); return 'running' }; "
+    "$sp = @{ FilePath = $env:CNC_EXE; PassThru = $true }; "
     "if ($env:CNC_ARGLINE) { $sp.ArgumentList = $env:CNC_ARGLINE }; "
     "if ($env:CNC_CWD) { $sp.WorkingDirectory = [WildcardPattern]::Escape($env:CNC_CWD) }; "
-    "Start-Process @sp"
+    "try { $p = Start-Process @sp -ErrorAction Stop } catch { L ('launch FAILED: ' + $_.Exception.Message); return 'failed' }; "
+    "L ('launched, new pid ' + $p.Id); "
+    "Start-Sleep -Seconds 6; "
+    "$alive = [bool](Get-Process -Id $p.Id -ErrorAction SilentlyContinue); "
+    "$o = @(Others); "
+    "L ('verify: launched process alive: ' + $alive + ', other ' + $exeName + ' processes besides the old one: ' + $o.Count); "
+    "if ($o.Count -gt 0) { return 'ok' }; "
+    "return 'died' }; "
+    "try { "
+    "try { if ((Get-Item -LiteralPath $env:CNC_LOG -ErrorAction Stop).Length -gt 32768) { Move-Item -LiteralPath $env:CNC_LOG -Destination ($env:CNC_LOG + '.old') -Force -ErrorAction Stop } } catch { }; "
+    "L ('helper started: waiting for pid ' + $env:CNC_PID + ', timeout ' + $env:CNC_TIMEOUT + ' s, exe ' + $env:CNC_EXE + ', args ' + $env:CNC_ARGLINE + ', cwd ' + $env:CNC_CWD); "
+    "Wait-Process -Id $oldPid -Timeout ([int]$env:CNC_TIMEOUT) -ErrorAction SilentlyContinue; "
+    "$stillAlive = [bool](Get-Process -Id $oldPid -ErrorAction SilentlyContinue); "
+    "L ('wait finished; EDMC pid ' + $oldPid + ' still alive: ' + $stillAlive); "
+    "if ($stillAlive) { L 'GAVE UP: EDMC was still running after the timeout, nothing was launched'; exit 1 }; "
+    "$r = Launch; "
+    "if ($r -eq 'failed' -or $r -eq 'died') { L ('launch attempt 1 ' + $r + ', retrying once in 2 s'); Start-Sleep -Seconds 2; $r = Launch }; "
+    "if ($r -eq 'ok') { L 'RESTARTED'; exit 0 }; "
+    "if ($r -eq 'running') { L 'RESTARTED (already running, nothing launched)'; exit 0 }; "
+    "L ('GAVE UP: launch ' + $r + ' on the retry, EDMC was not restarted'); exit 3 "
+    "} catch { L ('GAVE UP: unexpected error: ' + $_.Exception.Message); exit 4 }"
 )
 
 
@@ -1407,7 +1442,16 @@ def _powershell_exe():
     return "powershell.exe"
 
 
-def build_restart_helper(pid, exe, args, cwd=None, timeout=60):
+RESTART_LOG_NAME = "restart-helper.log"
+
+
+def restart_log_path():
+    """Where the restart helper writes its log: beside the plugin, or the temp folder if that is unknown."""
+    d = PLUGIN_DIR_OVERRIDE or _plugin_dir or tempfile.gettempdir()
+    return os.path.join(d, RESTART_LOG_NAME)
+
+
+def build_restart_helper(pid, exe, args, cwd=None, timeout=60, log_path=None):
     """The restart helper's command line and the environment variables it needs (pure): (cmd, env).
     The helper waits for EDMC's process to end and then starts the same program again. If EDMC is
     still alive when the wait times out it exits 1 without starting anything, so a second copy can
@@ -1418,15 +1462,16 @@ def build_restart_helper(pid, exe, args, cwd=None, timeout=60):
         "CNC_EXE": str(exe),
         "CNC_ARGLINE": subprocess.list2cmdline([str(a) for a in args]) if args else "",
         "CNC_CWD": str(cwd) if cwd else "",
+        "CNC_LOG": str(log_path or restart_log_path()),
     }
     cmd = [_powershell_exe(), "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", _RESTART_SCRIPT]
     return cmd, env
 
 
-def spawn_restart_helper(pid, exe, args, timeout=60, cwd=None):
+def spawn_restart_helper(pid, exe, args, timeout=60, cwd=None, log_path=None):
     """Starts the helper windowless and independent of this process (own process group, no shared handles)."""
     CREATE_NO_WINDOW, CREATE_NEW_PROCESS_GROUP = 0x08000000, 0x00000200
-    cmd, extra = build_restart_helper(pid, exe, args, cwd=cwd, timeout=timeout)
+    cmd, extra = build_restart_helper(pid, exe, args, cwd=cwd, timeout=timeout, log_path=log_path)
     env = dict(os.environ)
     env.update(extra)
     return subprocess.Popen(cmd, env=env,
@@ -1442,6 +1487,35 @@ def restart_target(frozen, executable, argv):
     return (executable, argv[1:]) if frozen else (executable, argv)
 
 
+def _edmc_shutting_down():
+    """True when EDMC says it is shutting down. Tk's event_generate must not be called then (it can hang Tk).
+    `shutting_down` is a property on EDMC's config; a callable one is called. Missing, None or raising: False."""
+    try:
+        value = getattr(edmc_config, "shutting_down", False) if edmc_config is not None else False
+        if callable(value):
+            value = value()
+        return bool(value)
+    except Exception:
+        return False
+
+
+def echo_restart_log(lines=6):
+    """Prints the last few lines of the restart helper's log to EDMC's log, so a failed restart shows up there
+    on the next start. Prints nothing when there is no log. Never raises."""
+    try:
+        with open(restart_log_path(), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        rows = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in rows[-lines:]:
+            print("[CarrierNavComms] last restart: " + ln)
+    except Exception:
+        pass
+
+
 def restart_edmc():
     """Closes EDMC and relaunches it. Returns (started, message). EDMC is only asked to close after the
     helper has started, so a failure never leaves the user without EDMC."""
@@ -1454,12 +1528,15 @@ def restart_edmc():
     with _restart_lock:
         if _restart_requested:
             return False, "A restart is already under way."
+        if _edmc_shutting_down():
+            return False, "EDMC is already shutting down."
         try:
             exe, args = restart_target(getattr(sys, "frozen", False), sys.executable, sys.argv)
             spawn_restart_helper(os.getpid(), exe, args, cwd=os.getcwd())
         except Exception as e:
             return False, "Update installed, but the restart helper could not start (%s). %s" % (e, manual)
         _restart_requested = True     # a helper is now waiting on EDMC: a second one must never be started
+    print("[CarrierNavComms] Restart helper started; it writes restart-helper.log in the plugin folder.")
     try:
         frame = getattr(prefs_changed, "frame", None)
         top = frame.winfo_toplevel() if frame is not None else None
@@ -1633,6 +1710,7 @@ def plugin_start3(plugin_dir):
     seed_dock_state_from_logs()
     reconstruct_exploration_tally_from_logs()
     print("[CarrierNavComms] Plugin loaded successfully.")
+    echo_restart_log()
     return "CarrierNavComms"
 
 
