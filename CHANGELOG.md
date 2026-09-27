@@ -1,5 +1,9 @@
 # Changelog
 
+## ver-1.3.0.1 - 2026-09-27
+
+- Documentation cleanup. No change to how the plugin works.
+
 ## ver-1.3.0.0 - 2026-09-27
 
 - **Fetch ID** can now search all of your journals. It still reads your 25 newest journal files first. If it finds nothing and you have more files than that, the carrier card offers **Search all my journals**. It shows how far it has got, has a **Cancel** button, and the settings window stays usable while it works. While it runs, the card's Callsign and Numeric ID boxes are locked, and if either was changed during the search, the result is not applied and you're told to press **Fetch ID** again.
