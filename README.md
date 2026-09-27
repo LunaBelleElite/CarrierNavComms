@@ -59,8 +59,10 @@ it reports comes from your own Elite Dangerous journals.
    button that opens it, under Plugins), then restart EDMC.
 2. In EDMC's settings, open the **CarrierNavComms** tab, click
    **+ Add Fleet Carrier**, type its callsign in **Callsign (ID)** and click
-   **Fetch ID**. It searches your recent journals for the carrier's numeric ID;
-   if it finds nothing, dock at the carrier once and try again.
+   **Fetch ID**. It searches your 25 newest journals for the carrier's numeric ID.
+   If it finds nothing, it offers to search all of them (with progress and a
+   Cancel button), or you can dock at the carrier, or open its Carrier Services
+   panel in the game, and press Fetch ID again.
 3. Fill in **Name** and an **Inara URL** for the carrier's picture, paste
    webhooks under **Discord Webhook Channels** with **+ Add New Webhook**, and
    press Apply or OK to save.

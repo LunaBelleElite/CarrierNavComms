@@ -24,7 +24,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.2.1.1"
+PLUGIN_VERSION = "ver-1.3.0.0"
 
 try:
     from config import config as edmc_config
@@ -359,31 +359,64 @@ def get_journal_directory():
     return None
 
 
-def fetch_carrier_details_from_logs(callsign):
-    """Scans recent journal files for a given carrier callsign, returning (numeric_id, owner_cmdr).
+JOURNAL_QUICK_FILE_COUNT = 25      # the quick Fetch ID scan reads this many of the newest journal files
+CANCEL_GUARD_SECONDS = 0.5         # a Cancel press this soon after a search started is a double click and is ignored
 
-    CarrierStats only ever appears in the owning commander's own journal, so a match there lets us
-    also read that journal's Commander name to confidently identify the carrier's owner. A match via
-    a plain Docked event doesn't prove ownership, so it's kept only as a fallback while every file is
-    checked for a definitive CarrierStats match — the owner may not have docked with the carrier
-    recently (e.g. it's off running trades unattended), so CarrierStats can be several sessions back.
-    """
-    if not callsign:
-        return None, None
 
+def _search_clock():
+    return time.monotonic()
+
+
+def _mtime_or_zero(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:                 # removed between the directory listing and now
+        return 0
+
+
+def _journal_files_newest_first():
+    """Every Journal.*.log in the journal folder, newest first, or None when the journal folder is unknown."""
     journal_dir = get_journal_directory()
     if not journal_dir:
-        return None, None
+        return None
+    return sorted(glob.glob(os.path.join(journal_dir, "Journal.*.log")), key=_mtime_or_zero, reverse=True)
 
-    log_files = sorted(glob.glob(os.path.join(journal_dir, "Journal.*.log")), key=os.path.getmtime, reverse=True)
-    if not log_files:
-        return None, None
+
+def journal_file_count():
+    """How many journal files the journal folder holds (0 when the folder is unknown)."""
+    journal_dir = get_journal_directory()
+    if not journal_dir:
+        return 0
+    return len(glob.glob(os.path.join(journal_dir, "Journal.*.log")))
+
+
+def _scan_journals(callsign, files, progress=None, cancelled=None, unreadable=None):
+    """Scans the given journal files, in the order given, for a carrier callsign.
+
+    Returns (numeric_id, owner_cmdr, scanned, was_cancelled). CarrierStats only ever appears in the owning
+    commander's own journal, so a match there lets us also read that journal's Commander name to confidently
+    identify the carrier's owner, and it ends the scan at once. A match via a plain Docked event doesn't prove
+    ownership, so it's kept only as a fallback while every file is checked for a definitive CarrierStats match
+    - the owner may not have docked with the carrier recently (e.g. it's off running trades unattended), so
+    CarrierStats can be several sessions back.
+
+    progress(done, total) is called after each file that was scanned to its end. cancelled() is checked before
+    each file; when it says True the scan stops with no result at all (a fallback seen so far is dropped).
+    A file that could not be read (open error, locked, a directory) is skipped; its path is appended to the
+    optional `unreadable` list so the caller can say so. The return shape is unchanged.
+    """
+    if not callsign:
+        return None, None, 0, False
 
     search_term = callsign.strip().upper()
     fallback_id = None
+    total = len(files)
+    scanned = 0
 
-    # Scan the last 25 journal files for maximum coverage
-    for log_path in log_files[:25]:
+    for log_path in files:
+        if cancelled is not None and cancelled():
+            return None, None, scanned, True
+        scanned += 1
         try:
             commander_name = None
             with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -409,7 +442,7 @@ def fetch_carrier_details_from_logs(callsign):
                             c_id = str(data.get("CarrierID", "") or "").strip()
                             if search_term == c_sign or search_term in c_sign:
                                 if c_id:
-                                    return c_id, commander_name
+                                    return c_id, commander_name, scanned, False
 
                         elif event == "Docked" and data.get("StationType") == "FleetCarrier":
                             st_name = data.get("StationName", "").strip().upper()
@@ -421,9 +454,48 @@ def fetch_carrier_details_from_logs(callsign):
                     except json.JSONDecodeError:
                         continue
         except Exception:
-            continue
+            if unreadable is not None:
+                unreadable.append(log_path)
+        if progress is not None:
+            progress(scanned, total)
 
-    return (fallback_id, None) if fallback_id else (None, None)
+    if fallback_id:
+        return fallback_id, None, scanned, False
+    return None, None, scanned, False
+
+
+def quick_search_journals(callsign):
+    """The quick scan: the JOURNAL_QUICK_FILE_COUNT newest journal files. Returns the _scan_journals tuple, or
+    None when the journal folder is unknown."""
+    if not callsign:
+        return None, None, 0, False
+    files = _journal_files_newest_first()
+    if files is None:
+        return None
+    return _scan_journals(callsign, files[:JOURNAL_QUICK_FILE_COUNT])
+
+
+def search_all_journals(callsign, progress=None, cancelled=None, unreadable=None):
+    """Scans EVERY journal file, newest first. Returns (numeric_id, owner_cmdr, scanned, was_cancelled, total), or
+    None when the journal folder is unknown. See _scan_journals for progress, cancelled and unreadable."""
+    if not callsign:
+        return None, None, 0, False, 0
+    files = _journal_files_newest_first()
+    if files is None:
+        return None
+    found_id, owner, scanned, was_cancelled = _scan_journals(callsign, files, progress, cancelled, unreadable)
+    return found_id, owner, scanned, was_cancelled, len(files)
+
+
+def fetch_carrier_details_from_logs(callsign):
+    """Scans recent journal files for a given carrier callsign, returning (numeric_id, owner_cmdr).
+
+    Reads the JOURNAL_QUICK_FILE_COUNT newest files; see _scan_journals for how a match is judged.
+    """
+    result = quick_search_journals(callsign)
+    if result is None:
+        return None, None
+    return result[0], result[1]
 
 
 def fetch_carrier_id_from_logs(callsign):
@@ -2255,6 +2327,336 @@ def _nudge_on_screen(top):
         return "skipped"
 
 
+class _JournalSearch:
+    """One carrier card's Fetch ID search.
+
+    quick() is the synchronous scan of the newest journal files and shows its own outcome. If it finds nothing a
+    row with a "Search all my journals" button appears; that search runs on a worker thread, which never touches
+    Tk: it only puts progress and its result on a queue that the UI thread polls with after(), the same shape as
+    the updater. The poll timer lives on the main window when it is known (else on the settings frame) and is
+    cancelled the moment the card is destroyed, because Tk can leave a timer registered on a widget that is gone.
+    """
+    POLL_MS = 100
+    WRAP = 560
+    CHANGED_CALLSIGN = "The callsign changed while searching, so the result was not applied. Press Fetch ID again."
+    CHANGED_NUMERIC_ID = "The Numeric ID box was changed while searching, so the result was not applied."
+    NO_JOURNALS = "No journal files were found in your Elite Dangerous journal folder."
+
+    SEARCH_TEXT = "Search all my journals"
+    THREAD_NAME = "CarrierNavComms journal search"
+
+    def __init__(self, frame, card, status_lbl, callsign_var, num_id_var, owner_var, on_layout=None):
+        self.frame = frame
+        self.status_lbl = status_lbl
+        self.callsign_var = callsign_var
+        self.num_id_var = num_id_var
+        self.owner_var = owner_var
+        self.on_layout = on_layout
+        self.btn_fetch = None                       # set by the card once its Fetch ID button exists
+        self.ent_callsign = None                    # ... and its Callsign and Numeric ID entries, locked while a search runs
+        self.ent_num_id = None
+        self._started_at = 0.0
+        self._start_callsign = ""
+        self._start_num_id = ""
+        self.running = False
+        self.closed = False
+        self.cancelling = False
+        self.poll_target = None
+        self._after_id = None
+        self._cancel = threading.Event()
+        self._results = None
+        self.row = ttk.Frame(card)
+        self.btn_search_all = ttk.Button(self.row, text=self.SEARCH_TEXT, width=22, command=self.press)
+        self.btn_search_all.pack(side="left")
+        Tooltip(self.btn_search_all, "Reads every one of your journal files, newest first, looking for this carrier. It can take a while when you have many journals, and you can press Cancel at any time.")
+        self.btn_search_all.bind("<Destroy>", self._on_destroy, add="+")
+
+    # ---- small helpers (every widget touch tolerates a destroyed window)
+    def _touch(self, fn):
+        try:
+            fn()
+            return True
+        except (TclError, RuntimeError, AttributeError):
+            return False
+
+    def _status(self, text, color, wrap=False):
+        def show():
+            if not self.status_lbl.winfo_manager():
+                self.status_lbl.pack(fill="x", padx=10, pady=(2, 5))
+            self.status_lbl.config(text=text, foreground=color)
+            if wrap:
+                self.status_lbl.config(wraplength=self.WRAP, justify="left")
+        self._touch(show)
+
+    def _layout(self):
+        if self.on_layout is not None:
+            try:
+                self.on_layout()
+            except (TclError, RuntimeError):
+                pass
+
+    def _show_row(self):
+        def show():
+            if self.status_lbl.winfo_manager():
+                self.row.pack(fill="x", padx=10, pady=(0, 5), after=self.status_lbl)
+            else:
+                self.row.pack(fill="x", padx=10, pady=(0, 5))
+        self._touch(show)
+
+    def _hide_row(self):
+        self._touch(self.row.pack_forget)
+
+    def _set_entries(self, enabled):
+        for ent in (self.ent_callsign, self.ent_num_id):
+            if ent is not None:
+                self._touch(lambda e=ent: e.state(["!disabled" if enabled else "disabled"]))
+
+    def _set_idle_buttons(self):
+        self._touch(lambda: self.btn_fetch.state(["!disabled"]))
+        self._touch(lambda: self.btn_search_all.config(text=self.SEARCH_TEXT))
+        self._touch(lambda: self.btn_search_all.state(["!disabled"]))
+
+    @staticmethod
+    def _found_text(found_id, found_owner):
+        if found_owner:
+            return f"Success! Found Numeric ID: {found_id} (Owner: {found_owner})"
+        return f"Success! Found Numeric ID: {found_id}"
+
+    def _show_found(self, found_id, found_owner):
+        def fill():
+            self.num_id_var.set(found_id)
+            if found_owner:
+                self.owner_var.set(found_owner)
+        self._touch(fill)
+        self._status(self._found_text(found_id, found_owner), "green")
+        self._hide_row()
+
+    # ---- the quick search (synchronous) and the empty-callsign message
+    def no_callsign(self):
+        self._hide_row()
+        self._status("Please enter a Callsign (ID) first.", "red")
+        self._layout()
+
+    def quick(self, callsign):
+        self._hide_row()
+        self._status(f"Scanning recent journals for '{callsign}'...", "blue")
+        try:
+            result = quick_search_journals(callsign)
+            count = journal_file_count() if result is not None else 0
+        except Exception as e:
+            self._status(f"Search stopped because of an error: {e}", "red", wrap=True)
+            self._layout()
+            return
+        if result is None:
+            self._status("Couldn't find your Elite Dangerous journal folder.", "red", wrap=True)
+        elif result[0]:
+            self._show_found(result[0], result[1])
+        elif count == 0:
+            self._status("No journal files were found in your Elite Dangerous journal folder.", "orange", wrap=True)
+        elif count <= JOURNAL_QUICK_FILE_COUNT:
+            # the quick search already read every journal file, so searching them all again would find nothing new
+            files = "file" if count == 1 else "files"
+            self._status(
+                f"No ID found in your {count} journal {files} for '{callsign}'. "
+                f"Dock at the carrier in the game (or open its Carrier Services panel) and press Fetch ID again.",
+                "orange", wrap=True)
+        else:
+            everything = f"all {count} of your journals" if count != 1 else "your 1 journal"
+            self._status(
+                f"No ID found in your {JOURNAL_QUICK_FILE_COUNT} newest journal files for '{callsign}'. "
+                f"You can search {everything}, or dock at the carrier in the game "
+                f"(or open its Carrier Services panel) and press Fetch ID again.",
+                "orange", wrap=True)
+            self._show_row()
+        self._layout()
+
+    # ---- the search of every journal
+    def press(self):
+        """The Search / Cancel button."""
+        if self.closed:
+            return
+        if self.running:
+            self.cancel()
+            return
+        try:
+            callsign = self.callsign_var.get().strip()
+        except (TclError, RuntimeError):
+            return
+        if not callsign:
+            self.no_callsign()
+            return
+        self.start(callsign)
+
+    def start(self, callsign):
+        """Begins the all-journals search. Returns False (and does nothing) if one is already running."""
+        if self.running or self.closed:
+            return False
+        self.running = True
+        self.cancelling = False
+        self._started_at = _search_clock()
+        self._start_callsign = callsign
+        try:
+            self._start_num_id = self.num_id_var.get()
+        except (TclError, RuntimeError):
+            self._start_num_id = ""
+        cancel = threading.Event()
+        results = queue.Queue()
+        self._cancel, self._results = cancel, results
+        self._touch(lambda: self.btn_fetch.state(["disabled"]))
+        self._set_entries(False)
+        self._touch(lambda: self.btn_search_all.config(text="Cancel"))
+        try:
+            total = journal_file_count()
+        except Exception:
+            total = 0
+        self._status(f"Searching all journals: 0 of {total} (newest first)...", "blue", wrap=True)
+        threading.Thread(target=_journal_search_worker, args=(callsign, results, cancel),
+                         name=self.THREAD_NAME, daemon=True).start()
+        if not self._schedule():
+            self.shutdown()
+        return True
+
+    def cancel(self):
+        if not self.running or self.cancelling:
+            return
+        if _search_clock() - self._started_at < CANCEL_GUARD_SECONDS:
+            return                  # a double click: the press that started the search must not also cancel it
+        self.cancelling = True
+        self._cancel.set()
+        self._touch(lambda: self.btn_search_all.state(["disabled"]))
+        self._status("Cancelling the search...", "blue")
+
+    def _schedule(self):
+        """Queues the next poll on the main window if there is one, else on the settings frame. A destroyed widget
+        is skipped: Tk would still accept the timer, and nothing would ever cancel it."""
+        for target in (_main_window, self.frame):
+            if target is None or not _widget_alive(target):
+                continue
+            try:
+                self._after_id = target.after(self.POLL_MS, self._poll)
+                self.poll_target = target
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _cancel_poll(self):
+        target, after_id = self.poll_target, self._after_id
+        self._after_id = None
+        if target is None or after_id is None:
+            return
+        try:
+            target.after_cancel(after_id)
+        except Exception:
+            pass
+        try:
+            target.tk.call("after", "cancel", after_id)     # after_cancel gives up on a destroyed widget
+        except Exception:
+            pass
+
+    def _poll(self):
+        self._after_id = None
+        if self.closed or not self.running:
+            return
+        latest = None
+        final = None
+        try:
+            while True:
+                item = self._results.get_nowait()
+                if item[0] == "progress":
+                    latest = item
+                else:
+                    final = item
+                    break
+        except queue.Empty:
+            pass
+        try:
+            if final is not None:
+                self._finish(final)
+                return
+            if latest is not None and not self.cancelling:
+                self._status(f"Searching all journals: {latest[1]} of {latest[2]} (newest first)...", "blue")
+        except Exception:
+            pass
+        if not self._schedule():
+            self.shutdown()
+
+    def _finish(self, item):
+        self.running = False
+        self.cancelling = False
+        self._cancel_poll()
+        self._set_idle_buttons()
+        self._set_entries(True)
+        if item[0] == "error":
+            self._status(f"Search stopped because of an error: {item[1]}", "red", wrap=True)
+            self._show_row()
+        elif item[1] is None:
+            self._status("Couldn't find your Elite Dangerous journal folder.", "red", wrap=True)
+            self._hide_row()
+        else:
+            found_id, owner, scanned, was_cancelled, total = item[1]
+            unreadable = item[2] if len(item) > 2 else 0
+            files = "file" if total == 1 else "files"
+            if total == 0:
+                self._status(self.NO_JOURNALS, "orange", wrap=True)
+                self._hide_row()
+            elif not was_cancelled and self._stale_reason(found_id) is not None:
+                self._status(self._stale_reason(found_id), "orange", wrap=True)
+                self._hide_row()
+            elif was_cancelled:
+                self._status(f"Search cancelled after {scanned} of {total} {files}.", "orange", wrap=True)
+                self._show_row()
+            elif found_id:
+                self._show_found(found_id, owner)
+            else:
+                if total == 1:
+                    text = "Not found in your 1 journal file. Dock at the carrier in the game once, or open Carrier Services, then press Fetch ID again."
+                else:
+                    unread = f" ({unreadable} could not be read)" if unreadable else ""
+                    text = f"Not found in any of your {total} journal files{unread}. Dock at the carrier in the game once, or open Carrier Services, then press Fetch ID again."
+                self._status(text, "orange", wrap=True)
+                self._show_row()
+        self._layout()
+
+    def _stale_reason(self, found_id):
+        """Why a finished search must not be applied to the card, or None when it may be."""
+        try:
+            if self.callsign_var.get().strip().upper() != self._start_callsign.strip().upper():
+                return self.CHANGED_CALLSIGN
+            if found_id and self.num_id_var.get() != self._start_num_id:
+                return self.CHANGED_NUMERIC_ID
+        except (TclError, RuntimeError):
+            return self.CHANGED_CALLSIGN
+        return None
+
+    def shutdown(self):
+        """Stops the search and its poll timer. Widgets are only touched best-effort (it can run while the card is
+        being destroyed, and then they are already gone)."""
+        self.closed = True
+        self.running = False
+        self._cancel.set()
+        self._cancel_poll()
+        self._set_entries(True)
+
+    def _on_destroy(self, event):
+        if event.widget is self.btn_search_all:
+            self.shutdown()
+
+
+def _journal_search_worker(callsign, results, cancel):
+    """Worker thread body: reads journal files and reports through the queue. It must never touch Tk."""
+    try:
+        unreadable = []
+        outcome = search_all_journals(
+            callsign,
+            progress=lambda done, total: results.put(("progress", done, total)),
+            cancelled=cancel.is_set,
+            unreadable=unreadable)
+        results.put(("done", outcome, len(unreadable)))
+    except Exception as e:
+        results.put(("error", str(e)))
+
+
 class _TestsSection:
     """One carrier card's test-button rows behind a 'Send test messages' toggle.
 
@@ -2474,33 +2876,21 @@ def plugin_prefs(notebook, cmdr, is_beta):
 
             status_lbl = ttk.Label(card, text="", font=("Helvetica", 8))
 
-            def run_fetch_id(target_callsign_var, num_id_var, owner_var, lbl):
+            search = _JournalSearch(frame, card, status_lbl, v_id, v_num_id, v_owner, lambda: _on_tests_toggled())
+
+            def run_fetch_id(target_callsign_var, num_id_var, owner_var, lbl, js):
                 callsign = target_callsign_var.get().strip()
                 if not callsign:
-                    lbl.pack(fill="x", padx=10, pady=(2, 5))
-                    lbl.config(text="Please enter a Callsign (ID) first.", foreground="red")
+                    js.no_callsign()
                     return
+                js.quick(callsign)
 
-                lbl.pack(fill="x", padx=10, pady=(2, 5))
-                lbl.config(text=f"Scanning recent journals for '{callsign}'...", foreground="blue")
-
-                found_id, found_owner = fetch_carrier_details_from_logs(callsign)
-                if found_id:
-                    num_id_var.set(found_id)
-                    if found_owner:
-                        owner_var.set(found_owner)
-                        lbl.config(text=f"Success! Found Numeric ID: {found_id} (Owner: {found_owner})", foreground="green")
-                    else:
-                        lbl.config(text=f"Success! Found Numeric ID: {found_id}", foreground="green")
-                else:
-                    lbl.config(
-                        text=f"No ID found in recent logs for '{callsign}'. Try opening Carrier Services in-game.",
-                        foreground="orange"
-                    )
-
-            btn_fetch = ttk.Button(r1, text="Fetch ID", width=9, command=lambda cv=v_id, nv=v_num_id, ov=v_owner, sl=status_lbl: run_fetch_id(cv, nv, ov, sl))
+            btn_fetch = ttk.Button(r1, text="Fetch ID", width=9, command=lambda cv=v_id, nv=v_num_id, ov=v_owner, sl=status_lbl, js=search: run_fetch_id(cv, nv, ov, sl, js))
             btn_fetch.pack(side="left", padx=(0, 10))
-            Tooltip(btn_fetch, "Scans your recent journal logs for this Callsign's Numeric ID and, if you're the owner, your Commander name. If no match is found, dock with the carrier once in-game and try again.")
+            search.btn_fetch = btn_fetch
+            search.ent_callsign = ent_id
+            search.ent_num_id = ent_num_id
+            Tooltip(btn_fetch, "Scans your newest journal logs for this Callsign's Numeric ID and, if you're the owner, your Commander name. If no match is found you can search all your journals, or dock with the carrier once in-game and try again.")
 
             ttk.Label(r1, text="Name:").pack(side="left", padx=(0, 2))
             ent_name = ttk.Entry(r1, textvariable=v_name, width=16)
@@ -2700,7 +3090,9 @@ def plugin_prefs(notebook, cmdr, is_beta):
                 "v_inara": v_inara,
                 "v_owner": v_owner,
                 "v_use_inara": v_use_inara,
-                "chk_use_inara": chk_use_inara
+                "chk_use_inara": chk_use_inara,
+                "btn_fetch": btn_fetch,
+                "search": search
             })
             card_idx += 1
 

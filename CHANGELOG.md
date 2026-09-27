@@ -1,5 +1,11 @@
 # Changelog
 
+## ver-1.3.0.0 - 2026-09-27
+
+- **Fetch ID** can now search all of your journals. It still reads your 25 newest journal files first. If it finds nothing and you have more files than that, the carrier card offers **Search all my journals**. It shows how far it has got, has a **Cancel** button, and the settings window stays usable while it works. While it runs, the card's Callsign and Numeric ID boxes are locked, and if either was changed during the search, the result is not applied and you're told to press **Fetch ID** again.
+- The "not found" messages now say what to do next: search all your journals, or dock at the carrier in the game (or open its Carrier Services panel) and press **Fetch ID** again. If the plugin can't find your Elite Dangerous journal folder, it now says that.
+- Limits: it can only find what your journals contain, so a carrier you have never docked at and never opened Carrier Services for stays not found. **Cancel** takes effect between files, so one very large journal file has to finish first. A journal file the plugin can't read (for example one another program has locked) is skipped, and the message tells you how many. How long the search takes depends on your disk and on how many journals you have.
+
 ## ver-1.2.1.1 - 2026-09-26
 
 - **Check for updates** now finds the plugin's own `load.py` even if EDMC reports a different folder for it. If it still can't find one, it tells you where it looked and changes nothing, instead of showing a raw "No such file" error.
