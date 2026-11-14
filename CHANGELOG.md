@@ -1,5 +1,15 @@
 # Changelog
 
+## ver-1.4.0.0 - 2026-11-14
+
+- Fixed: a big cartographics turn-in now posts the right counts on every page. The game splits more than 50 systems into several sales, and the later posts used to show 0 first discoveries and 0 first mapped while the first post carried the whole total. Each post now counts only the systems it contains.
+- Fixed: a first mapped was missed when the body's scan came after the mapping, or when an earlier sale had already cleared the count.
+- Fixed: bodies seen only by a navigation beacon were counted as first discoveries, even though the game never pays for them. One station sale showed 140 first discoveries because of it.
+- Changed: when the game pays no bonus on a sale, the post now shows 0 first discoveries and 0 first mapped, matching what you were paid. The bonus is the first-discovery and first-mapped payout combined.
+- Unchanged on purpose: belt clusters still count once per system, and the Vista Genomics post needed no change.
+- Checked against real journals: roughly one cartographics sale in five used to show wrong counts, and none did in that check.
+- Installs on 1.1.0.0 or newer will offer this through the **Check for updates** button.
+
 ## ver-1.3.0.1 - 2026-09-27
 
 - Documentation cleanup. No change to how the plugin works.

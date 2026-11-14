@@ -25,7 +25,8 @@ it reports comes from your own Elite Dangerous journals.
   market** each get a message, so the fuel gauge isn't a mystery.
 - **Universal Cartographics** turn-ins report the payout, systems and bonus,
   with **first-discovery and first-mapped counts from your own scans**: each
-  body counts once, the tally resets when you sell, and it rebuilds from your
+  body counts once, each sale reports only the systems it sold (so every page of a
+  big turn-in gets its own counts), a sale that paid no bonus shows 0, and it rebuilds from your
   journals when EDMC starts. If Elite logs the payout zeroed, **you see an
   estimate** marked with a tilde and a note, not a flat 0 CR.
 - **Vista Genomics** turn-ins get their own message. Sales are noticed even if

@@ -24,7 +24,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.3.0.1"
+PLUGIN_VERSION = "ver-1.4.0.0"
 
 try:
     from config import config as edmc_config
@@ -213,15 +213,57 @@ carrier_previous_system = {}
 # pending_belt_systems_counted caps belt cluster (asteroid ring cluster) discoveries at
 # 1 per system instead of 1 per cluster -- a single ring can have dozens of individually
 # scannable clusters, which otherwise buries the actual planet/star discovery count.
+#
+# A sale does NOT sell everything: Universal Cartographics sells at most 50 systems per
+# "MultiSellExplorationData", so one turn-in is often several sale events seconds apart,
+# and data can also be sold a system at a time. Each sale event lists the systems it sold
+# ("Discovered"), so the tally is also kept per system (pending_system_tally, with
+# pending_system_names mapping SystemAddress to the upper-cased name the sale will use):
+# a sale reports and removes only its own systems, and the rest stay pending. The two
+# plain counters remain the totals over everything pending.
+# pending_mapped_unconfirmed holds bodies whose SAAScanComplete arrived with no earlier
+# Scan on record; the game writes a Scan of the same body right after every mapping, and
+# that Scan's WasMapped decides. pending_mapped_bodies stops one body counting twice.
 pending_first_discoveries = 0
 pending_first_mapped = 0
 pending_mapped_candidates = {}
 pending_discovered_bodies = set()
 pending_belt_systems_counted = set()
+pending_system_names = {}
+pending_system_tally = {}
+pending_mapped_unconfirmed = set()
+pending_mapped_bodies = set()
+
+
+def _credit_exploration(system_addr, discoveries=0, mapped=0):
+    """Adds to the running totals and to the per-system tally a later sale reads."""
+    global pending_first_discoveries, pending_first_mapped
+    pending_first_discoveries += discoveries
+    pending_first_mapped += mapped
+    if system_addr is not None:
+        tally = pending_system_tally.setdefault(system_addr, [0, 0])
+        tally[0] += discoveries
+        tally[1] += mapped
+
+
+def _clear_exploration_tally():
+    """Forgets everything pending: on death, and on a sale that does not say what it sold."""
+    global pending_first_discoveries, pending_first_mapped
+    pending_first_discoveries = 0
+    pending_first_mapped = 0
+    pending_mapped_candidates.clear()
+    pending_discovered_bodies.clear()
+    pending_belt_systems_counted.clear()
+    pending_system_names.clear()
+    pending_system_tally.clear()
+    pending_mapped_unconfirmed.clear()
+    pending_mapped_bodies.clear()
 
 
 def apply_exploration_event(entry):
-    """Updates the running first-discovery/first-mapped tally from a single journal entry."""
+    """Updates the running first-discovery/first-mapped tally from a single journal entry.
+    For a sale event it returns (first_discoveries, first_mapped) for the systems that sale
+    sold and stops tracking them; for every other event it returns None."""
     global pending_first_discoveries, pending_first_mapped
 
     event = entry.get("event")
@@ -231,8 +273,13 @@ def apply_exploration_event(entry):
         body_id = entry.get("BodyID")
         body_key = (system_addr, body_id) if system_addr is not None and body_id is not None else None
         is_belt_cluster = "Belt Cluster" in entry.get("BodyName", "")
+        star_system = entry.get("StarSystem")
+        if system_addr is not None and star_system:
+            pending_system_names[system_addr] = str(star_system).strip().upper()
 
-        if entry.get("WasDiscovered") is False:
+        # A nav beacon hands over the system's bodies (ScanType NavBeaconDetail), often
+        # flagged WasDiscovered false, but that is not exploration data: it is never sold.
+        if entry.get("WasDiscovered") is False and entry.get("ScanType") != "NavBeaconDetail":
             if body_key is None or body_key not in pending_discovered_bodies:
                 if body_key is not None:
                     pending_discovered_bodies.add(body_key)
@@ -240,34 +287,67 @@ def apply_exploration_event(entry):
                 if is_belt_cluster:
                     if system_addr is not None and system_addr not in pending_belt_systems_counted:
                         pending_belt_systems_counted.add(system_addr)
-                        pending_first_discoveries += 1
+                        _credit_exploration(system_addr, discoveries=1)
                     # else: this system's belt clusters were already counted once, skip
                 else:
-                    pending_first_discoveries += 1
+                    _credit_exploration(system_addr, discoveries=1)
 
-        if entry.get("WasMapped") is False and body_key is not None:
-            pending_mapped_candidates[body_key] = True
+        if body_key is not None:
+            if body_key in pending_mapped_unconfirmed:
+                # Mapped before any Scan of it was on record: this Scan is the game's word.
+                pending_mapped_unconfirmed.discard(body_key)
+                if entry.get("WasMapped") is False and body_key not in pending_mapped_bodies:
+                    pending_mapped_bodies.add(body_key)
+                    _credit_exploration(system_addr, mapped=1)
+            elif entry.get("WasMapped") is False and body_key not in pending_mapped_bodies:
+                pending_mapped_candidates[body_key] = True
 
     elif event == "SAAScanComplete":
         system_addr = entry.get("SystemAddress")
-        body_id = entry.get("BodyID")
-        if (system_addr, body_id) in pending_mapped_candidates:
-            del pending_mapped_candidates[(system_addr, body_id)]
-            pending_first_mapped += 1
+        body_key = (system_addr, entry.get("BodyID"))
+        if body_key in pending_mapped_candidates:
+            del pending_mapped_candidates[body_key]
+            if body_key not in pending_mapped_bodies:
+                pending_mapped_bodies.add(body_key)
+                _credit_exploration(system_addr, mapped=1)
+        elif body_key not in pending_mapped_bodies:
+            pending_mapped_unconfirmed.add(body_key)
 
     elif event == "Died":
-        pending_first_discoveries = 0
-        pending_first_mapped = 0
-        pending_mapped_candidates.clear()
-        pending_discovered_bodies.clear()
-        pending_belt_systems_counted.clear()
+        _clear_exploration_tally()
 
     elif event in ("SellExplorationData", "MultiSellExplorationData"):
-        pending_first_discoveries = 0
-        pending_first_mapped = 0
-        pending_mapped_candidates.clear()
-        pending_discovered_bodies.clear()
-        pending_belt_systems_counted.clear()
+        sold_names = set()
+        discovered = entry.get("Discovered")
+        for item in discovered if isinstance(discovered, list) else []:
+            if isinstance(item, dict) and item.get("SystemName"):
+                sold_names.add(str(item["SystemName"]).strip().upper())
+
+        if not sold_names:
+            # The event does not say which systems it sold (the partially-zeroed sale Elite
+            # sometimes writes), so nothing can be attributed: report everything pending
+            # and start over, as before.
+            sold = (pending_first_discoveries, pending_first_mapped)
+            _clear_exploration_tally()
+            return sold
+
+        sold_addrs = set(addr for addr, name in pending_system_names.items() if name in sold_names)
+        discoveries = mapped = 0
+        for system_addr in sold_addrs:
+            tally = pending_system_tally.pop(system_addr, (0, 0))
+            discoveries += tally[0]
+            mapped += tally[1]
+            del pending_system_names[system_addr]
+        pending_belt_systems_counted.difference_update(sold_addrs)
+        for bodies in (pending_discovered_bodies, pending_mapped_unconfirmed, pending_mapped_bodies):
+            bodies.difference_update([key for key in bodies if key[0] in sold_addrs])
+        for key in [key for key in pending_mapped_candidates if key[0] in sold_addrs]:
+            del pending_mapped_candidates[key]
+        pending_first_discoveries -= discoveries
+        pending_first_mapped -= mapped
+        return discoveries, mapped
+
+    return None
 
 
 def reconstruct_exploration_tally_from_logs():
@@ -3477,11 +3557,23 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # First-discovery/first-mapped tally bookkeeping. This runs unconditionally, regardless
     # of surveillance settings or carrier matching, because Universal Cartographics resets
     # the underlying game data on ANY sale -- whether at a Fleet Carrier or a regular
-    # station -- so the tally has to track that too or it'll drift out of sync.
+    # station -- so the tally has to track that too or it'll drift out of sync. A sale
+    # returns the counts for the systems it actually sold (see apply_exploration_event).
     first_discoveries_this_sale = pending_first_discoveries
     first_mapped_this_sale = pending_first_mapped
     if event in ("Scan", "SAAScanComplete", "Died", "SellExplorationData", "MultiSellExplorationData"):
-        apply_exploration_event(entry)
+        sold_tally = apply_exploration_event(entry)
+        if sold_tally is not None:
+            first_discoveries_this_sale, first_mapped_this_sale = sold_tally
+            # The sale's Bonus is the combined first-discovery plus first-mapped payout. A
+            # Bonus present and equal to 0 means the game paid none, so report 0/0 (the
+            # tally was still consumed above). A missing Bonus key is unknown and keeps the
+            # scan-based counts; so does the malformed sale, which is handled further down.
+            _bonus = entry.get("Bonus")
+            _malformed = (not entry.get("TotalEarnings", 0) and not entry.get("Discovered")
+                          and entry.get("BaseValue", 0))
+            if "Bonus" in entry and not isinstance(_bonus, bool) and _bonus == 0 and not _malformed:
+                first_discoveries_this_sale = first_mapped_this_sale = 0
 
     # Scan/SAAScanComplete fire hundreds of times per system honk and contribute nothing
     # beyond the tally above (no station, callsign, or system fields we track), so stop
@@ -3824,9 +3916,9 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             systems_str = f"{systems_count:,}"
             bonus_str = f"{bonus:,}"
 
-        # first_discoveries_this_sale / first_mapped_this_sale are the exact counts tallied
-        # live from "Scan" (WasDiscovered) and "SAAScanComplete" events since the last sale,
-        # captured just before this same event reset the running tally back to zero above.
+        # first_discoveries_this_sale / first_mapped_this_sale are the counts tallied from
+        # "Scan" (WasDiscovered) and "SAAScanComplete" events for the systems this sale
+        # lists, returned by apply_exploration_event above when it removed them.
         embed = generate_embed_from_config(
             "cartographics", cmdr, display_carrier_name,
             total_earned=total_earned_str, systems=systems_str, bonus=bonus_str,
