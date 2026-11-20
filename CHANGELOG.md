@@ -1,5 +1,14 @@
 # Changelog
 
+## ver-1.4.0.2 - 2026-11-20
+
+- New: CarrierNavComms now has a license, the CarrierNavComms Community License, in `LICENSE.md` in the repository and as a short notice at the top of the plugin file, so it travels with the plugin.
+- In short: it is free to use, and you may change your own copy for your own use.
+- You may share the unmodified original, with the notice, free of charge. Modified versions may not be distributed, so report problems as issues instead of handing out private forks.
+- It comes with no warranty, and it is not affiliated with Frontier Developments, EDMC or Discord. The README has a short section on it.
+- Nothing about how the plugin works has changed.
+- Installs on 1.1.0.0 or newer will offer this through the **Check for updates** button.
+
 ## ver-1.4.0.0 - 2026-11-14
 
 - Fixed: a big cartographics turn-in now posts the right counts on every page. The game splits more than 50 systems into several sales, and the later posts used to show 0 first discoveries and 0 first mapped while the first post carried the whole total. Each post now counts only the systems it contains.

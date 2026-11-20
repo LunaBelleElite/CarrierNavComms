@@ -1,3 +1,9 @@
+# CarrierNavComms - an unofficial, fan-made plugin for EDMC (Elite Dangerous Market Connector).
+# Licensed under the CarrierNavComms Community License: free for your own personal use, and you may
+# share the unmodified original with this notice, free of charge. Modified versions of it may not be
+# distributed. Full terms: LICENSE.md at https://github.com/LunaBelleElite/CarrierNavComms
+# Not affiliated with Frontier Developments, EDMC or Discord. Provided as-is, with no warranty.
+
 import os
 import sys
 import re
@@ -24,7 +30,7 @@ import requests
 from datetime import datetime, timezone
 from tkinter import ttk, StringVar, BooleanVar, Label, Toplevel, Canvas, messagebox, TclError
 
-PLUGIN_VERSION = "ver-1.4.0.0"
+PLUGIN_VERSION = "ver-1.4.0.2"
 
 try:
     from config import config as edmc_config

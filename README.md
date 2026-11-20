@@ -130,6 +130,14 @@ It needs nothing beyond GitHub and updates only from the
 an hour, and you're told when they're used up. A copy older than the button
 has to be updated by hand, once.
 
+## You can use it freely, but only the original gets shared
+
+Use it and change your own copy as much as you like, free of charge. You can
+hand the unmodified original to others, with its license notice, but not a
+modified version. The full terms are in [LICENSE.md](LICENSE.md). It's an
+unofficial, fan-made tool, not affiliated with Frontier Developments, EDMC or
+Discord.
+
 ## How it was built, and where to report trouble
 
 CarrierNavComms was written with Claude Code, on Luna-Core (a starter kit for
